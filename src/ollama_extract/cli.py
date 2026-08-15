@@ -36,6 +36,9 @@ Examples:
   # 200 inputs, 4 parallel workers
   uv run ollama-extract --count 200 --workers 4
 
+  # Auto-detect optimal workers (recommended)
+  uv run ollama-extract --count 200 --auto-workers
+
   # 3000 inputs, single backend, JSON export
   uv run ollama-extract --count 3000 --backend requests --output results.json
 
@@ -69,7 +72,12 @@ Examples:
         "--workers", "-w",
         type=int,
         default=4,
-        help="Concurrent ThreadPoolExecutor workers (default: 4).",
+        help="Concurrent ThreadPoolExecutor workers (default: 4). Use --auto-workers to auto-detect.",
+    )
+    parser.add_argument(
+        "--auto-workers", "-aw",
+        action="store_true",
+        help="Auto-detect the optimal worker count via a warmup benchmark. Overrides --workers.",
     )
     parser.add_argument(
         "--seed", "-s",
@@ -217,18 +225,21 @@ def main(argv: list[str] | None = None) -> int:
     n = len(inputs)
     show_progress = not args.quiet
 
+    workers = 0 if args.auto_workers else args.workers
+
     if show_progress:
+        workers_display = "auto-detect" if args.auto_workers else str(args.workers)
         console.print(Panel.fit(
             f"[bold cyan]ollama-extract[/bold cyan]\n"
             f"Model: [green]{model}[/green]  |  Inputs: {n} ({source})  |  "
-            f"Workers: {args.workers}  |  Backend(s): {args.backend}",
+            f"Workers: {workers_display}  |  Backend(s): {args.backend}",
             border_style="cyan",
         ))
 
     extractor = ConcurrentExtractor(
         model_name=model,
         ollama_url=args.ollama_url,
-        max_workers=args.workers,
+        max_workers=workers,
     )
 
     results = extractor.run(

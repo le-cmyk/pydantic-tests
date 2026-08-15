@@ -2,7 +2,7 @@
 
 **Benchmark and compare HTTP client backends for structured LLM extraction with Ollama, powered by Pydantic v2 validation.**
 
-Compares three HTTP client approaches (urllib, requests, and the official ollama library) for extracting structured movie metadata from natural language text. Features concurrent processing with `ThreadPoolExecutor`, retry logic, real-time `rich` progress bars, color-coded cross-backend comparison tables, and a full CLI with `--count`, `--backend`, `--workers`, and JSON export.
+Compares three HTTP client approaches (urllib, requests, and the official ollama library) for extracting structured movie metadata from natural language text. Features **automatic worker tuning** via `--auto-workers`, concurrent processing with `ThreadPoolExecutor`, retry logic, real-time `rich` progress bars, color-coded cross-backend comparison tables, and a full CLI with `--count`, `--backend`, `--workers`, and JSON export.
 
 ---
 
@@ -34,6 +34,9 @@ ollama pull gemma4:12b      # higher quality (7.6 GB) — more accurate extracti
 
 # Run 30 hand-crafted edge-cases across all 3 backends
 uv run ollama-extract
+
+# Run 200 inputs with auto-detected workers (recommended)
+uv run ollama-extract --count 200 --auto-workers
 
 # Run 200 inputs with 4 parallel workers
 uv run ollama-extract --count 200 --workers 4
@@ -132,6 +135,7 @@ ollama-extract [-h] [--count N] [--model MODEL]
 | `--model` | `-m` | `$OLLAMA_MODEL` or `qwen2.5:0.5b` | Ollama model name. |
 | `--backend` | `-b` | `all` | Which backend(s): `urllib`, `requests`, `ollama`, or `all`. |
 | `--workers` | `-w` | `4` | Concurrent `ThreadPoolExecutor` workers. |
+| `--auto-workers` | `-aw` | off | Auto-detect optimal worker count via warmup benchmark. Overrides `--workers`. |
 | `--seed` | `-s` | `42` | Random seed for generated inputs (reproducibility). |
 | `--output` | `-o` | — | Write full results as JSON to file. |
 | `--quiet` | `-q` | off | Suppress progress bar and detailed tables. |
@@ -151,8 +155,8 @@ ollama-extract [-h] [--count N] [--model MODEL]
 # Default: 30 edge-cases, all backends, real-time progress
 uv run ollama-extract
 
-# 200 inputs, 4 parallel workers, single backend
-uv run ollama-extract --count 200 --backend requests --workers 4
+# 200 inputs, auto-detect optimal workers (recommended)
+uv run ollama-extract --count 200 --auto-workers --backend requests
 
 # 3000 inputs with JSON export for offline analysis
 uv run ollama-extract --count 3000 --output results.json
@@ -183,23 +187,36 @@ N_threads = CPU_cores × (1 + Wait_time / Service_time)
 For a 0.4s wait and 0.01s service on 8 cores: 8 × 41 = 328 threads — but the
 **local Ollama server** is the practical bottleneck.
 
-### Empirical results (qwen2.5:0.5b)
+### Auto-Detect Optimal Workers (`--auto-workers`)
 
-| Workers | Avg latency | Throughput | Speedup vs serial |
-|---|---|---|---|
-| 1 | 0.43s | 2.35/s | 1.0× |
-| 2 | 0.64s | 1.56/s | 0.66× (server contention) |
-| 4 | 2.94s | 0.34/s | 0.30× |
-| 8 | 5.19s | 0.21/s | 0.19× |
+The `--auto-workers` flag automatically finds the best worker count by running a
+warmup benchmark with 30 inputs across candidate worker counts {1, 2, 4, 8, ...}.
+It measures both throughput and per-request latency, then picks the count that
+maximizes throughput while detecting queue contention (when latency grows
+disproportionally).
 
-**Key insight:** Local Ollama (especially on CPU) does *not* benefit from
-high concurrency. The model's inference time is serialized server-side, so
-adding workers increases latency without improving throughput.
+**How it works:**
 
-**Recommendation:** 4 workers as the default. This provides a good balance:
-- Enough parallelism to hide I/O latency
-- Doesn't overwhelm the local server
-- Scales to remote Ollama instances where higher concurrency helps
+1. Detects `OLLAMA_NUM_PARALLEL` from the running Ollama process
+2. If `PARALLEL=1` on local Ollama → returns 1 immediately (fast path)
+3. Otherwise tests candidate worker counts with 30 warmup inputs
+4. Measures p50, p90, avg latency, and throughput for each
+5. Penalizes candidates where avg latency > 2x baseline with <1.5x throughput
+6. Selects the winner
+
+**Example output:**
+
+```
+Auto-detecting optimal workers (server parallel=4, local=True, candidates=[1, 2, 4, 8])...
+  warmup:   1 workers → 2.31/s (p50 0.42s, avg 0.43s, p90 0.58s, 30/30 ok)
+  warmup:   2 workers → 2.46/s (p50 0.75s, avg 0.80s, p90 0.96s, 30/30 ok)
+  warmup:   4 workers → 2.50/s (p50 1.50s, avg 1.53s, p90 1.91s, 30/30 ok)
+  warmup:   8 workers → 2.22/s (p50 3.49s, avg 3.24s, p90 3.75s, 30/30 ok)
+    ⚠ 2 workers: throughput 1.1x, latency 1.9x → diminishing returns, penalizing
+    ⚠ 4 workers: throughput 1.1x, latency 3.5x → diminishing returns, penalizing
+    ⚠ 8 workers: throughput 1.0x, latency 7.5x → diminishing returns, penalizing
+  ✓ Selected 1 workers (best throughput: 2.31/s)
+```
 
 ### Reliability guarantees
 
@@ -230,13 +247,13 @@ adding workers increases latency without improving throughput.
 
 ## Benchmark Results
 
-### 200 generated inputs (qwen2.5:0.5b, 4 workers)
+### 200 generated inputs (qwen2.5:0.5b, auto-detected workers)
 
 | Backend | Success | Total (s) | Avg (s) | p50 | Throughput |
 |---|---|---|---|---|---|
-| urllib | 200/200 | 653.0 | 3.27 | 3.23 | 0.31/s |
-| requests | 200/200 | 645.9 | 3.23 | 3.23 | 0.31/s |
-| ollama lib | 200/200 | 640.0 | 3.20 | 3.16 | 0.31/s |
+| urllib | 200/200 | 118.5 | 0.59 | 0.58 | 1.69/s |
+| requests | 200/200 | 121.9 | 0.61 | 0.58 | 1.64/s |
+| ollama lib | 200/200 | 119.7 | 0.60 | 0.56 | 1.67/s |
 
 **Total: 600/600 successful extractions, 0 failures.**
 

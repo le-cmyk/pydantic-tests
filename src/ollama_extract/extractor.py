@@ -2,8 +2,11 @@
 
 import json
 import os
+import re
+import sys
 import time
 import logging
+import subprocess
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -23,6 +26,9 @@ from rich.table import Table as RichTable
 from rich.panel import Panel
 from rich import box
 
+from ollama_extract.model import get_movie_schema
+from ollama_extract.backends import get_backend
+
 logger = logging.getLogger(__name__)
 console = Console()
 
@@ -39,63 +45,232 @@ def is_local_ollama(ollama_url: str) -> bool:
     return any(p in ollama_url for p in _LOCAL_PATTERNS)
 
 
-def auto_detect_workers(ollama_url: str, model_name: str, sample_inputs: list[str] | None = None) -> int:
-    """Auto-detect the optimal worker count by running a warmup benchmark.
+def get_ollama_parallel() -> int | None:
+    """Detect the server's OLLAMA_NUM_PARALLEL setting.
+
+    Tries to read it from the environment of the running Ollama process.
+    Returns None if it can't be determined (defaults to 1).
+    """
+    # Check local environment first
+    env_val = os.environ.get("OLLAMA_NUM_PARALLEL")
+    if env_val:
+        try:
+            return int(env_val)
+        except ValueError:
+            pass
+
+    # Check the running Ollama process environment
+    try:
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                ["ps", "ax", "-o", "command", "-E"],
+                capture_output=True, text=True, timeout=5,
+            )
+        else:
+            result = subprocess.run(
+                ["ps", "aux"],
+                capture_output=True, text=True, timeout=5,
+            )
+        for line in result.stdout.splitlines():
+            if "ollama" in line.lower() and "serve" in line.lower():
+                match = re.search(r"OLLAMA_NUM_PARALLEL=(\d+)", line)
+                if match:
+                    return int(match.group(1))
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return None
+
+
+def auto_detect_workers(
+    ollama_url: str,
+    model_name: str,
+    sample_inputs: list[str] | None = None,
+) -> int:
+    """Auto-detect the optimal client-side worker count via a warmup benchmark.
 
     Strategy:
-        1. Detect CPU cores and whether Ollama is local or remote.
-        2. Compute a heuristic initial count (local = min(cores, 4), remote = min(cores*2, 16)).
-        3. Run a warmup benchmark with workers in {1, 2, heuristic} on 3 inputs.
-        4. Pick the worker count with the best throughput.
+        1. Detect whether Ollama is local or remote.
+        2. Read ``OLLAMA_NUM_PARALLEL`` if available (default 1).
+        3. If local with server parallel=1: return 1 (sequential server → sequential client).
+        4. Otherwise, build a candidate pool of worker counts (powers of 2 +
+           server_parallel).
+        5. Run a warmup benchmark with 30 inputs for each candidate.
+        6. Pick the worker count with the best throughput, penalizing candidates
+           where latency grew faster than throughput (queue contention).
     """
-    from ollama_extract.model import Movie, get_movie_schema
-    from ollama_extract.backends import get_backend
-
     cpu_cores = os.cpu_count() or 4
     local = is_local_ollama(ollama_url)
+    server_parallel = get_ollama_parallel() or 1
 
-    if local:
-        heuristic = min(cpu_cores, 4)
-    else:
-        heuristic = min(cpu_cores * 2, 16)
+    # Fast path: local Ollama with no server parallelism → 1 worker
+    if server_parallel == 1 and local:
+        console.print(
+            f"  [dim]Auto-detect: server parallel=1 (local), "
+            f"using 1 worker (sequential server → sequential client is optimal)[/dim]"
+        )
+        schema = get_movie_schema()
+        if sample_inputs is None:
+            from ollama_extract.generator import TEST_INPUTS
+            sample_inputs = TEST_INPUTS[:12]
+        backend = get_backend("urllib", model_name, ollama_url)
 
-    # Warmup candidates
-    candidates = sorted(set([1, 2, heuristic]))
+        start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            futures = [
+                executor.submit(_timed_extract, backend, text, schema)
+                for text in sample_inputs[:12]
+            ]
+            for f in as_completed(futures):
+                f.result()
+        elapsed = time.perf_counter() - start
+        throughput = 12 / elapsed
+        console.print(
+            f"  [green]✓ Confirmed 1 worker: {throughput:.2f}/s "
+            f"({elapsed:.1f}s for 12 inputs)[/green]"
+        )
+        return 1
+
+    # Build candidate pool
+    max_candidate = max(8, server_parallel * 2)
+    if not local:
+        max_candidate = max(max_candidate, 16)
+
+    candidates: list[int] = [1]
+    w = 2
+    while w <= max_candidate:
+        if w not in candidates:
+            candidates.append(w)
+        w *= 2
+    if server_parallel > 1 and server_parallel not in candidates:
+        candidates.append(server_parallel)
+    sp2 = server_parallel * 2
+    if sp2 > max_candidate and sp2 <= 32 and sp2 not in candidates:
+        candidates.append(sp2)
+
+    candidates = sorted(c for c in candidates if c <= 32)
+
     schema = get_movie_schema()
 
-    # Use sample inputs or a default
     if sample_inputs is None:
         from ollama_extract.generator import TEST_INPUTS
-        sample_inputs = TEST_INPUTS[:3]
+        sample_inputs = TEST_INPUTS[:30]
 
-    samples = sample_inputs[:3]
-    best_throughput = 0.0
-    best_workers = heuristic
+    benchmark_inputs = sample_inputs[:30]
     backend = get_backend("urllib", model_name, ollama_url)
 
+    console.print(
+        f"  [dim]Auto-detecting optimal workers "
+        f"(server parallel={server_parallel}, local={local}, "
+        f"candidates={candidates}, warmup={len(benchmark_inputs)} inputs)...[/dim]"
+    )
+
+    # Pre-warm: send 1 request to load the model into VRAM
+    try:
+        _timed_extract(backend, benchmark_inputs[0], schema)
+        console.print(f"  [dim]Model warmed up.[/dim]")
+    except Exception:
+        pass
+
+    results: dict[int, tuple[float, float, float, float]] = {}
+
     for workers in candidates:
-        if workers > len(samples):
-            continue
         start = time.perf_counter()
-        success = 0
+        latencies: list[float] = []
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(_single_extract, backend, text, schema): i
-                for i, text in enumerate(samples)
+                executor.submit(_timed_extract, backend, text, schema): i
+                for i, text in enumerate(benchmark_inputs)
             }
             for future in as_completed(futures):
                 result = future.result()
                 if result.success:
-                    success += 1
+                    latencies.append(result.elapsed)
+
         elapsed = time.perf_counter() - start
+        success = len(latencies)
         throughput = success / elapsed if elapsed > 0 else 0
-        console.print(f"  [dim]warmup: {workers} workers → {throughput:.2f}/s ({success}/{len(samples)} ok)[/dim]")
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0
+        sorted_lats = sorted(latencies)
+        p90 = sorted_lats[int(len(sorted_lats) * 0.9)] if sorted_lats else 0
+        p50 = sorted_lats[len(sorted_lats) // 2] if sorted_lats else 0
+
+        results[workers] = (throughput, avg_latency, p90, p50)
+        console.print(
+            f"  [dim]warmup: {workers:>3} workers → {throughput:.2f}/s "
+            f"(p50 {p50:.2f}s, avg {avg_latency:.2f}s, p90 {p90:.2f}s, "
+            f"{success}/{len(benchmark_inputs)} ok, {elapsed:.1f}s)[/dim]"
+        )
+
+    # Select best: highest throughput, but penalize candidates that show
+    # diminishing returns (latency grew faster than throughput).
+    # effective_ratio = (throughput_ratio) / (latency_ratio)
+    # A value >= 1.0 means parallelization is genuinely beneficial.
+    best_throughput = 0.0
+    best_workers = DEFAULT_MAX_WORKERS
+    baseline_avg = results.get(1, (0, 0, 0, 0))[1]
+    baseline_tp = results.get(1, (0, 0, 0, 0))[0]
+
+    for workers, (throughput, avg_lat, p90, p50) in results.items():
+        if baseline_avg > 0 and baseline_tp > 0:
+            latency_ratio = avg_lat / baseline_avg
+            throughput_ratio = throughput / baseline_tp
+            effective_ratio = throughput_ratio / latency_ratio if latency_ratio > 0 else 0
+
+            # For local Ollama, require strong evidence of parallelism benefit
+            threshold = 0.95 if local else 0.8
+
+            if effective_ratio < threshold:
+                console.print(
+                    f"    [yellow]⚠ {workers} workers: throughput {throughput_ratio:.1f}x, "
+                    f"latency {latency_ratio:.1f}x → diminishing returns "
+                    f"(effective ratio {effective_ratio:.2f} < {threshold}), "
+                    f"penalizing[/yellow]"
+                )
+                throughput *= 0.1
 
         if throughput > best_throughput:
             best_throughput = throughput
             best_workers = workers
 
+    console.print(
+        f"  [green]✓ Selected {best_workers} workers "
+        f"(best throughput: {best_throughput:.2f}/s)[/green]"
+    )
     return best_workers
+
+
+def _timed_extract(backend: Any, text: str, schema: dict[str, Any]) -> "ExtractionResult":
+    """Single extraction that records precise per-request latency."""
+    from ollama_extract.model import Movie
+
+    result = ExtractionResult(
+        index=0,
+        input_text=text,
+        success=False,
+        elapsed=0.0,
+        backend=backend.name,
+    )
+    start = time.perf_counter()
+    try:
+        resp = backend.generate(_build_prompt(text, schema), schema)
+        result.elapsed = time.perf_counter() - start
+
+        result.prompt_tokens = resp.prompt_tokens
+        result.eval_tokens = resp.eval_tokens
+        result.total_duration_ms = resp.total_duration_ms
+
+        movie = backend.validate(resp.content)
+        result.success = True
+        result.title = movie.title
+        result.year = movie.year
+        result.genres = movie.genres
+    except Exception as e:
+        result.elapsed = time.perf_counter() - start
+        result.error = str(e)
+        result.error_type = type(e).__name__
+    return result
 
 
 def _build_prompt(raw_text: str, schema: dict[str, Any]) -> str:
@@ -114,37 +289,6 @@ Text to extract from:
 ---
 {raw_text}
 ---"""
-
-
-def _single_extract(backend: Any, text: str, schema: dict[str, Any]) -> "ExtractionResult":
-    """Low-level single extraction used by auto_detect_workers."""
-    from ollama_extract.model import Movie
-
-    result = ExtractionResult(
-        index=0,
-        input_text=text,
-        success=False,
-        elapsed=0.0,
-        backend=backend.name,
-    )
-    start = time.perf_counter()
-    try:
-        resp = backend.generate(_build_prompt(text, schema), schema)
-        result.elapsed = time.perf_counter() - start
-        result.prompt_tokens = resp.prompt_tokens
-        result.eval_tokens = resp.eval_tokens
-        result.total_duration_ms = resp.total_duration_ms
-
-        movie = backend.validate(resp.content)
-        result.success = True
-        result.title = movie.title
-        result.year = movie.year
-        result.genres = movie.genres
-    except Exception as e:
-        result.elapsed = time.perf_counter() - start
-        result.error = str(e)
-        result.error_type = type(e).__name__
-    return result
 
 
 # ---------------------------------------------------------------------------
