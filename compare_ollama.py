@@ -1,8 +1,8 @@
 """Benchmark comparison: urllib vs requests vs ollama for calling Ollama API.
 
 Each backend performs the same extraction task (Movie model) and supports
-JSON-schema structured output.  Results are printed in a comparison table
-plus detailed per-input statistics.
+JSON-schema structured output.  Results are printed in comparison tables
+with color-coded differences.
 """
 
 import json
@@ -31,6 +31,33 @@ logger = logging.getLogger(__name__)
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = os.environ.get("OLLAMA_MODEL", "qwen2.5:0.5b")
 MAX_RETRIES = 3
+USE_COLOR = sys.stdout.isatty() if (sys := __import__("sys")) else False
+
+
+# ---------------------------------------------------------------------------
+#  ANSI colors
+# ---------------------------------------------------------------------------
+
+class C:
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+
+def _c(text: str, color: str) -> str:
+    if not USE_COLOR:
+        return text
+    return f"{color}{text}{C.RESET}"
+
+
+# ---------------------------------------------------------------------------
+#  Test inputs — 30 hard edge-cases
+# ---------------------------------------------------------------------------
 
 TEST_INPUTS = [
     #  0 — title only in quotes, no genres
@@ -168,7 +195,6 @@ def _categorize_error(e: Exception) -> str:
 
 
 def _extract_metrics(body: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
-    """Pull token counts and duration from Ollama response."""
     return (
         body.get("prompt_eval_count"),
         body.get("eval_count"),
@@ -286,7 +312,6 @@ def print_detailed_stats(results: list[ExtractionResult], label: str) -> None:
     successes = [r for r in results if r.success]
     failures = [r for r in results if not r.success]
     times = [r.elapsed for r in successes]
-    retries = [r.retries for r in successes]
     pt_vals = [r.prompt_tokens for r in successes if r.prompt_tokens is not None]
     et_vals = [r.eval_tokens for r in successes if r.eval_tokens is not None]
     td_vals = [r.total_duration_ms for r in successes if r.total_duration_ms is not None]
@@ -311,18 +336,17 @@ def print_detailed_stats(results: list[ExtractionResult], label: str) -> None:
         print(f"    p99:    {_pct(times, 99):.3f}")
         print(f"    max:    {max(times):.3f}")
         print(f"    mean:   {statistics.mean(times):.3f}")
-        print(f"    stdev:  {statistics.stdev(times):.3f}" if len(times) > 1 else "")
-        print()
-
-    if retries:
-        print(f"  Retries needed:      {sum(retries)} (max {max(retries)} per input)")
+        if len(times) > 1:
+            print(f"    stdev:  {statistics.stdev(times):.3f}")
         print()
 
     if pt_vals:
         print(f"  Token counts:")
         print(f"    prompt eval:       {sum(pt_vals)} total, mean {statistics.mean(pt_vals):.0f}")
-        print(f"    eval:              {sum(et_vals)} total, mean {statistics.mean(et_vals):.0f}" if et_vals else "")
-        print(f"    total duration:    {sum(td_vals)/1000:.1f}s total" if td_vals else "")
+        if et_vals:
+            print(f"    eval:              {sum(et_vals)} total, mean {statistics.mean(et_vals):.0f}")
+        if td_vals:
+            print(f"    total duration:    {sum(td_vals)/1000:.1f}s total")
         print()
 
     if failures:
@@ -345,46 +369,154 @@ def print_detailed_stats(results: list[ExtractionResult], label: str) -> None:
     print()
 
 
-def print_per_input_table(results: list[ExtractionResult], label: str) -> None:
-    print(f"\n  Per-input results ({label}):")
-    print(f"  {'#':>3} {'Status':<6} {'Retries':>7} {'Time (s)':>9} {'Input len':>9} {'Result':<50}")
-    print(f"  {'─'*3} {'─'*6} {'─'*7} {'─'*9} {'─'*9} {'─'*50}")
-    for r in results:
-        status = "OK" if r.success else "FAIL"
-        result_str = f"{r.title} ({r.year})" if r.success else f"{r.error_type or 'error'}"
-        if len(result_str) > 48:
-            result_str = result_str[:45] + "..."
-        print(f"  {r.index:>3} {status:<6} {r.retries:>7} {r.elapsed:>9.3f} {r.input_len_chars:>9} {result_str:<50}")
+# ---------------------------------------------------------------------------
+#  Cross-backend comparison tables
+# ---------------------------------------------------------------------------
+
+BACKEND_NAMES = ["urllib", "requests", "ollama lib"]
+
+
+def print_title_year_comparison(all_results: dict[str, list[ExtractionResult]]) -> None:
+    """Per-input table showing title + year from all three backends, color-coded on disagreement."""
+    n = len(next(iter(all_results.values())))
+
+    print(f"\n{'=' * 120}")
+    print(f"  TITLE & YEAR COMPARISON (color = red when backends disagree)")
+    print(f"{'=' * 120}")
+
+    header = (
+        f"  {'#':>3}  "
+        f"{'urllib':<46}  "
+        f"{'requests':<46}  "
+        f"{'ollama lib':<46}"
+    )
+    print(_c(header, C.BOLD))
+    print(f"  {'─'*3}  {'─'*46}  {'─'*46}  {'─'*46}")
+
+    for i in range(n):
+        cells = []
+        disagreements = []
+        for name in BACKEND_NAMES:
+            r = all_results[name][i]
+            if r.success:
+                cell = f"{r.title} ({r.year})"
+            else:
+                cell = f"FAIL: {r.error_type}"
+            cells.append(cell)
+
+        # Check disagreement across successful results
+        titles = {c.split(" (")[0] for c in cells if "FAIL" not in c and cell is not None}
+        years = set()
+        for c in cells:
+            if "FAIL" not in c and "(" in c:
+                try:
+                    years.add(int(c.split(" (")[1].rstrip(")")))
+                except (ValueError, IndexError):
+                    pass
+
+        row_parts = []
+        for name, cell in zip(BACKEND_NAMES, cells):
+            has_disagreement = len(titles) > 1 or len(years) > 1
+            if has_disagreement and "FAIL" not in cell:
+                color = C.YELLOW
+            elif "FAIL" in cell:
+                color = C.RED
+            else:
+                color = ""
+            if len(cell) > 44:
+                cell = cell[:41] + "..."
+            row_parts.append(_c(f"{cell:<46}", color))
+
+        print(f"  {i:>3}  {'  '.join(row_parts)}")
+
     print()
 
 
-# ---------------------------------------------------------------------------
-#  Sample extractor for detailed inspection
-# ---------------------------------------------------------------------------
+def print_timing_comparison(all_results: dict[str, list[ExtractionResult]]) -> None:
+    """Side-by-side timing comparison per input, color-coded on divergence."""
+    n = len(next(iter(all_results.values())))
 
-def show_samples() -> None:
-    schema = Movie.model_json_schema()
-    tricky = [12, 17, 18, 19, 27]
-    print(f"\n{'=' * 70}")
-    print(f"  Sample extractions (model={MODEL_NAME}, backend=urllib)")
-    print(f"{'=' * 70}")
-    for idx in tricky:
-        text = TEST_INPUTS[idx]
-        try:
-            body, content = _call_urllib(text, schema)
-            movie = Movie.model_validate_json(content.strip())
-            pt = body.get("prompt_eval_count", "?")
-            et = body.get("eval_count", "?")
-            print(f"\n  [{idx:2d}] Input:  {text[:70]}")
-            print(f"       Title:   {movie.title}")
-            print(f"       Year:    {movie.year}")
-            print(f"       Genres:  {', '.join(movie.genres)}")
-            print(f"       Summary: {movie.summary[:90]}")
-            print(f"       Tokens:  prompt={pt}, eval={et}")
-        except Exception as e:
-            print(f"\n  [{idx:2d}] Input:  {text[:70]}")
-            print(f"       Error:   {type(e).__name__}: {e}")
+    print(f"\n{'=' * 90}")
+    print(f"  LATENCY COMPARISON (color = red if >2x difference from fastest)")
+    print(f"{'=' * 90}")
+
+    header = f"  {'#':>3}  {'Input len':>9}  {'urllib':>8} {'requests':>9} {'ollama':>7}  {'fastest':>8}"
+    print(_c(header, C.BOLD))
+    print(f"  {'─'*3}  {'─'*9}  {'─'*8} {'─'*9} {'─'*7}  {'─'*8}")
+
+    for i in range(n):
+        times = {name: all_results[name][i].elapsed for name in BACKEND_NAMES}
+        min_t = min(times.values())
+        max_t = max(times.values())
+        input_len = all_results[BACKEND_NAMES[0]][i].input_len_chars
+
+        cells = []
+        for name in BACKEND_NAMES:
+            t = times[name]
+            diff_ratio = t / min_t if min_t > 0 else 1
+            # Red if >2x slower than fastest
+            if diff_ratio > 2.0:
+                color = C.RED
+            elif diff_ratio > 1.5:
+                color = C.YELLOW
+            else:
+                color = ""
+            cells.append(_c(f"{t:>8.3f}", color))
+
+        fastest_name = min(times, key=times.get)
+        print(f"  {i:>3}  {input_len:>9}  {'  '.join(cells)}  {_c(fastest_name, C.CYAN):>8}")
     print()
+
+
+def print_consistency_matrix(all_results: dict[str, list[ExtractionResult]]) -> None:
+    """Agreement rate between each pair of backends on title + year."""
+    n = len(next(iter(all_results.values())))
+
+    print(f"\n{'=' * 60}")
+    print(f"  CROSS-BACKEND CONSISTENCY MATRIX (title + year agreement)")
+    print(f"{'=' * 60}")
+
+    pairs = [
+        ("urllib", "requests"),
+        ("urllib", "ollama lib"),
+        ("requests", "ollama lib"),
+    ]
+
+    for a, b in pairs:
+        agreements = 0
+        compared = 0
+        for i in range(n):
+            ra, rb = all_results[a][i], all_results[b][i]
+            if ra.success and rb.success:
+                compared += 1
+                if ra.title == rb.title and ra.year == rb.year:
+                    agreements += 1
+
+        rate = agreements / compared * 100 if compared else 0
+        color = C.GREEN if rate >= 95 else (C.YELLOW if rate >= 80 else C.RED)
+        print(f"  {_c(a, C.BOLD):<12} vs {b:<12}  {agreements}/{compared} agree "
+              f"({_c(f'{rate:.1f}%', color)})")
+    print()
+
+
+def print_error_summary(all_results: dict[str, list[ExtractionResult]]) -> None:
+    """Summarize any failures across all backends."""
+    total_errors = 0
+    for name in BACKEND_NAMES:
+        errors = [r for r in all_results[name] if not r.success]
+        total_errors += len(errors)
+
+    if total_errors == 0:
+        print(f"\n  {_c('No errors across any backend — all 90 extractions succeeded.', C.GREEN)}")
+        return
+
+    print(f"\n  {_c(f'{total_errors} total errors across all backends:', C.RED)}")
+    for name in BACKEND_NAMES:
+        errors = [r for r in all_results[name] if not r.success]
+        if errors:
+            print(f"  {name:<12}:")
+            for r in errors:
+                print(f"    #{r.index} — {r.error_type}: {r.error}")
 
 
 # ---------------------------------------------------------------------------
@@ -394,46 +526,69 @@ def show_samples() -> None:
 def main() -> None:
     n = len(TEST_INPUTS)
     backends = [
-        ("urllib        ", _call_urllib),
-        ("requests      ", _call_requests),
-        ("ollama lib    ", _call_ollama_lib),
+        ("urllib", _call_urllib),
+        ("requests", _call_requests),
+        ("ollama lib", _call_ollama_lib),
     ]
 
     print(f"Model: {MODEL_NAME}  |  Inputs per backend: {n}  |  Max retries: {MAX_RETRIES}")
 
     all_results: dict[str, list[ExtractionResult]] = {}
     for label, fn in backends:
-        label_stripped = label.strip()
-        results = _run_backend(TEST_INPUTS, fn, label_stripped)
-        all_results[label_stripped] = results
+        results = _run_backend(TEST_INPUTS, fn, label)
+        all_results[label] = results
 
-    # Summary table
+    # --- Summary table ---
     print(f"\n{'=' * 72}")
     print("  SUMMARY")
     print(f"{'=' * 72}")
     print(f"  {'Backend':<16} {'Success':>8} {'Total (s)':>11} {'Avg (s)':>9} {'Failures':>9}")
     print(f"  {'─'*16} {'─'*8} {'─'*11} {'─'*9} {'─'*9}")
     for label, _ in backends:
-        results = all_results[label.strip()]
+        results = all_results[label]
         s = sum(1 for r in results if r.success)
         t = sum(r.elapsed for r in results)
         f = n - s
         avg = t / s if s else float("inf")
-        print(f"  {label} {s:>8} {t:>11.2f} {avg:>9.3f} {f:>9}")
+        print(f"  {label:<16} {s:>8} {t:>11.2f} {avg:>9.3f} {f:>9}")
 
     total_ok = sum(sum(1 for r in results if r.success) for results in all_results.values())
     print(f"\n  Total successful extractions: {total_ok}/{n * len(backends)}")
 
-    # Detailed stats per backend
+    # --- Detailed stats per backend ---
     for label, _ in backends:
-        print_detailed_stats(all_results[label.strip()], label.strip())
+        print_detailed_stats(all_results[label], label)
 
-    # Per-input table for the first backend
-    first_label = backends[0][0].strip()
-    print_per_input_table(all_results[first_label], first_label)
+    # --- Cross-backend comparison tables ---
+    print_title_year_comparison(all_results)
+    print_timing_comparison(all_results)
+    print_consistency_matrix(all_results)
+    print_error_summary(all_results)
 
     if os.environ.get("SHOW_SAMPLES"):
-        show_samples()
+        show_samples(all_results)
+
+
+def show_samples(all_results: dict[str, list[ExtractionResult]]) -> None:
+    schema = Movie.model_json_schema()
+    tricky = [12, 17, 18, 19, 27]
+    print(f"\n{'=' * 70}")
+    print(f"  Sample extractions (model={MODEL_NAME})")
+    print(f"{'=' * 70}")
+    for idx in tricky:
+        text = TEST_INPUTS[idx]
+        for name in BACKEND_NAMES:
+            r = all_results[name][idx]
+            if r.success:
+                print(f"\n  [{idx:2d}] {name:>12} | Input: {text[:60]}")
+                print(f"       Title:   {r.title}")
+                print(f"       Year:    {r.year}")
+                print(f"       Genres:  {', '.join(r.genres)}")
+                print(f"       Tokens:  prompt={r.prompt_tokens}, eval={r.eval_tokens}")
+            else:
+                print(f"\n  [{idx:2d}] {name:>12} | Input: {text[:60]}")
+                print(f"       Error:   {r.error_type}: {r.error}")
+    print()
 
 
 if __name__ == "__main__":

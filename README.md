@@ -78,7 +78,7 @@ Requires a local Ollama instance. Two models are supported — `qwen2.5:0.5b` (f
 ollama pull qwen2.5:0.5b    # fast model for benchmarking
 ollama pull gemma4:12b      # higher-quality model
 
-uv run main.py              # 20 hard edge-case extractions with gemma4:12b
+uv run main.py              # 30 hard edge-case extractions with gemma4:12b
 uv run compare_ollama.py    # benchmark all three backends (uses qwen2.5:0.5b by default)
 
 # Use a different model:
@@ -140,9 +140,10 @@ All 20 cases pass. The larger model is ~10× slower per call but produces more a
 ## Project structure
 
 ```
-main.py            — extraction pipeline with 20 hard edge-case test inputs (gemma4:12b)
+main.py            — extraction pipeline with 30 hard edge-case test inputs (gemma4:12b)
 compare_ollama.py  — benchmark comparing urllib, requests, and ollama lib (qwen2.5:0.5b)
                      features: latency percentiles, token counts, throughput,
-                     per-input breakdown, error categorization, retry tracking
+                     per-input title/year comparison with color-coded disagreements,
+                     cross-backend consistency matrix, error categorization
 pyproject.toml     — dependencies and project config (uv-managed)
 ```
