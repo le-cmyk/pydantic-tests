@@ -131,19 +131,40 @@ def get_movie_data(raw_text: str) -> Movie:
 
 
 def main() -> None:
-    input_text = "I just watched 'Inception' - it's a sci-fi heist movie from 2010."
+    test_inputs = [
+        "I just watched 'Inception' - it's a sci-fi heist movie from 2010.",
+        "Just saw 'The Godfather' — a crime drama from 1972 that every aspiring filmmaker should study.",
+        "Last night I caught 'Parasite' on Netflix. It's a 2019 Korean thriller-comedy with incredible social commentary.",
+        "'Pulp Fiction' from 1994 is a nonlinear crime film by Tarantino that changed indie cinema forever.",
+        "Watched 'Spirited Away' yesterday — a 2001 Studio Ghibli animated fantasy masterpiece by Hayao Miyazaki.",
+        "I saw 'Mad Max: Fury Road' last week; a high-octane 2015 action film directed by George Miller.",
+        "'The Dark Knight' (2008) is a superhero film where Heath Ledger's Joker steals the show.",
+        "Just finished 'Everything Everywhere All at Once' — a 2022 absurdist comedy sci-fi multiverse adventure.",
+        "'Forrest Gump' is a 1994 American comedy-drama following a man with a low IQ through pivotal historical events.",
+        "Watched 'Blade Runner 2049' from 2017, a neo-noir sci-fi sequel that's visually stunning.",
+        "I finally saw 'Casablanca' — a 1942 wartime romantic drama that never gets old.",
+        "'The Lord of the Rings: The Fellowship of the Ring' (2001) kicks off Jackson's epic fantasy trilogy.",
+        "Just rewatched 'Fight Club' — David Fincher's 1999 psychological thriller about consumerism and identity.",
+        "'Amélie' is a 2001 French romantic comedy that's whimsical and charming throughout.",
+        "I caught 'Get Out' on a late-night stream. It's Jordan Peele's 2017 horror-comedy social thriller debut.",
+        "'La La Land' (2016) is a modern musical romance that pays homage to classic Hollywood.",
+        "Watched 'The Matrix' from 1999 — a groundbreaking cyberpunk sci-fi action film with innovative visuals.",
+        "'Interstellar' (2014) is Christopher Nolan's space epic about love, time, and survival.",
+        "Just saw 'Moonlight' — a 2016 coming-of-age drama told in three chapters of a young man's life.",
+        "'Arrival' (2016) is a cerebral sci-fi film about linguistics, time, and first contact.",
+    ]
 
     count_success = 0
     count_failures = 0
 
-    for i in range(10):
+    for i, input_text in enumerate(test_inputs):
         try:
             movie = get_movie_data(input_text)
             count_success += 1
-            print(f"[{i}] {movie.title} ({movie.year}) — {', '.join(movie.genres)}")
+            print(f"[{i:2d}] {movie.title} ({movie.year}) — {', '.join(movie.genres)}")
         except Exception as e:
             count_failures += 1
-            print(f"[{i}] Failed: {e}")
+            print(f"[{i:2d}] Failed: {e}")
 
     print(f"\nResults: {count_success} succeeded, {count_failures} failed")
 
