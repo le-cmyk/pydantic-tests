@@ -1,13 +1,16 @@
 """Benchmark comparison: urllib vs requests vs ollama for calling Ollama API.
 
 Each backend performs the same extraction task (Movie model) and supports
-JSON-schema structured output.  Results are printed in a comparison table.
+JSON-schema structured output.  Results are printed in a comparison table
+plus detailed per-input statistics.
 """
 
 import json
 import os
 import time
 import logging
+import statistics
+from dataclasses import dataclass, field
 from urllib import request
 from typing import Any
 
@@ -26,30 +29,29 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_HOST = "http://localhost:11434"
 MODEL_NAME = os.environ.get("OLLAMA_MODEL", "qwen2.5:0.5b")
 MAX_RETRIES = 3
 
 TEST_INPUTS = [
-    # 0 — title only in quotes, no genres
+    #  0 — title only in quotes, no genres
     "I saw 'Amélie' in 2001 — whimsical French film, no genres mentioned.",
-    # 1 — director reference, must infer title
+    #  1 — director reference, must infer title
     "That Christopher Nolan 2010 film about dream invasion — you know, the spinning top ending.",
-    # 2 — year as Roman numeral
+    #  2 — year as Roman numeral
     "The 1994 film 'Pulp Fiction' (MCMXCIV) — wait no that's not right, it's just 1994, a crime anthology.",
-    # 3 — multiple movies, must pick the one described
+    #  3 — multiple movies, must pick the one described
     "Like 'Alien' from 1979 and 'Aliens' from 1992, 'The Shining' (1980) is Kubrick's horror masterpiece — not the other two.",
-    # 4 — title implied through plot, never named
+    #  4 — title implied through plot, never named
     "A 1999 sci-fi action film about a hacker who learns reality is an illusion and takes a red pill — you know the one.",
-    # 5 — genre described as a feeling
+    #  5 — genre described as a feeling
     "That 2007 film 'There Will Be Blood' — it's oozing with greed, capitalism, and oil-soaked madness.",
-    # 6 — very long compound title, no year given
+    #  6 — very long compound title, no year given
     "The Lord of the Rings: The Return of the King concludes the trilogy — epic fantasy war from 2003.",
-    # 7 — deliberate year misinformation
+    #  7 — deliberate year misinformation
     "Everyone says 'Titanic' is from 1996, but James Cameron's epic disaster romance is actually 1997.",
-    # 8 — title in a URL-like format
+    #  8 — title in a URL-like format
     "I found a file called 'the-matrix-1999-dvdrip' — that's the cyberpunk action classic right?",
-    # 9 — text-speak / abbreviations
+    #  9 — text-speak / abbreviations
     "lmao 'Get Out' 2017 best horror social thriller everrr jordan peele killed it.",
     # 10 — non-English description, English title
     "이 영화 '인셉션' 2010 년 작품은 드림 속에서 비밀을 훔치는 팀을 보여줘요. sci-fi heist.",
@@ -133,160 +135,302 @@ Text to extract from:
 
 
 # ---------------------------------------------------------------------------
-#  Backend 1 — urllib (standard library)
+#  Stats collection
 # ---------------------------------------------------------------------------
 
-def run_urllib(texts: list[str]) -> tuple[int, float]:
-    schema = Movie.model_json_schema()
-    prompt_template = _build_prompt
-
-    success, total_time = 0, 0.0
-    for t in texts:
-        last_err: Exception | None = None
-        for _ in range(MAX_RETRIES):
-            try:
-                start = time.perf_counter()
-                payload = {"model": MODEL_NAME, "prompt": prompt_template(t, schema), "stream": False, "format": schema}
-                data = json.dumps(payload).encode("utf-8")
-                req = request.Request(OLLAMA_URL, data=data, headers={"Content-Type": "application/json"})
-                with request.urlopen(req) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
-                content = body.get("response", "").strip()
-                Movie.model_validate_json(content)
-                total_time += time.perf_counter() - start
-                success += 1
-                break
-            except Exception as e:
-                last_err = e
-        else:
-            logger.warning(f"urllib failed on: {t[:40]}... — {last_err}")
-
-    return success, total_time
+@dataclass
+class ExtractionResult:
+    index: int
+    success: bool
+    elapsed: float
+    retries: int = 0
+    prompt_tokens: int | None = None
+    eval_tokens: int | None = None
+    total_duration_ms: int | None = None
+    input_len_chars: int = 0
+    error: str | None = None
+    error_type: str | None = None
+    title: str | None = None
+    year: int | None = None
+    genres: list[str] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-#  Backend 2 — requests
-# ---------------------------------------------------------------------------
-
-def run_requests(texts: list[str]) -> tuple[int, float]:
-    schema = Movie.model_json_schema()
-
-    success, total_time = 0, 0.0
-    for t in texts:
-        last_err: Exception | None = None
-        for _ in range(MAX_RETRIES):
-            try:
-                start = time.perf_counter()
-                resp = requests_lib.post(
-                    OLLAMA_URL,
-                    json={"model": MODEL_NAME, "prompt": _build_prompt(t, schema), "stream": False, "format": schema},
-                    headers={"Content-Type": "application/json"},
-                    timeout=120,
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                content = body.get("response", "").strip()
-                Movie.model_validate_json(content)
-                total_time += time.perf_counter() - start
-                success += 1
-                break
-            except Exception as e:
-                last_err = e
-        else:
-            logger.warning(f"requests failed on: {t[:40]}... — {last_err}")
-
-    return success, total_time
+def _categorize_error(e: Exception) -> str:
+    if isinstance(e, json.JSONDecodeError):
+        return "json_decode"
+    if isinstance(e, ValidationError):
+        return "pydantic_validation"
+    if isinstance(e, Exception) and "HTTP" in type(e).__name__:
+        return "http_error"
+    if isinstance(e, OSError):
+        return "connection_error"
+    return type(e).__name__
 
 
-# ---------------------------------------------------------------------------
-#  Backend 3 — ollama library
-# ---------------------------------------------------------------------------
+def _extract_metrics(body: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+    """Pull token counts and duration from Ollama response."""
+    return (
+        body.get("prompt_eval_count"),
+        body.get("eval_count"),
+        body.get("total_duration"),
+    )
 
-def run_ollama_lib(texts: list[str]) -> tuple[int, float]:
+
+def _run_backend(
+    texts: list[str],
+    call_fn: Any,
+    backend_name: str,
+) -> list[ExtractionResult]:
+    """Generic runner that collects per-input stats for any backend callable."""
+    results: list[ExtractionResult] = []
     schema = Movie.model_json_schema()
 
-    success, total_time = 0, 0.0
-    for t in texts:
-        last_err: Exception | None = None
-        for _ in range(MAX_RETRIES):
+    for idx, text in enumerate(texts):
+        result = ExtractionResult(
+            index=idx,
+            success=False,
+            elapsed=0.0,
+            retries=0,
+            input_len_chars=len(text),
+        )
+
+        for attempt in range(MAX_RETRIES):
+            start = time.perf_counter()
             try:
-                start = time.perf_counter()
-                resp = ollama.generate(
-                    model=MODEL_NAME,
-                    prompt=_build_prompt(t, schema),
-                    format=schema,
-                    stream=False,
-                )
-                content = resp.get("response", "").strip()
-                Movie.model_validate_json(content)
-                total_time += time.perf_counter() - start
-                success += 1
+                body, content = call_fn(text, schema)
+                elapsed = time.perf_counter() - start
+                result.elapsed += elapsed
+
+                pt, et, td = _extract_metrics(body)
+                result.prompt_tokens = pt
+                result.eval_tokens = et
+                result.total_duration_ms = td // 1_000_000 if td else None
+
+                content = content.strip()
+                if not content:
+                    raise ValueError("Empty LLM response")
+
+                movie = Movie.model_validate_json(content)
+                result.success = True
+                result.title = movie.title
+                result.year = movie.year
+                result.genres = movie.genres
                 break
             except Exception as e:
-                last_err = e
-        else:
-            logger.warning(f"ollama-lib failed on: {t[:40]}... — {last_err}")
+                if attempt < MAX_RETRIES - 1:
+                    result.retries += 1
+                else:
+                    result.error = str(e)
+                    result.error_type = _categorize_error(e)
+            finally:
+                pass
 
-    return success, total_time
+        if not result.success:
+            logger.warning(f"{backend_name} #[idx] failed — {result.error_type}: {result.error}")
+        results.append(result)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+#  Backend callables
+# ---------------------------------------------------------------------------
+
+def _call_urllib(text: str, schema: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    payload = {"model": MODEL_NAME, "prompt": _build_prompt(text, schema), "stream": False, "format": schema}
+    data = json.dumps(payload).encode("utf-8")
+    req = request.Request(OLLAMA_URL, data=data, headers={"Content-Type": "application/json"})
+    with request.urlopen(req) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    return body, body.get("response", "")
+
+
+def _call_requests(text: str, schema: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    resp = requests_lib.post(
+        OLLAMA_URL,
+        json={"model": MODEL_NAME, "prompt": _build_prompt(text, schema), "stream": False, "format": schema},
+        headers={"Content-Type": "application/json"},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    return body, body.get("response", "")
+
+
+def _call_ollama_lib(text: str, schema: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    resp = ollama.generate(
+        model=MODEL_NAME,
+        prompt=_build_prompt(text, schema),
+        format=schema,
+        stream=False,
+    )
+    return resp, resp.get("response", "")
+
+
+# ---------------------------------------------------------------------------
+#  Stats display
+# ---------------------------------------------------------------------------
+
+def _pct(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    values_sorted = sorted(values)
+    k = (len(values_sorted) - 1) * p / 100
+    f = int(k)
+    c = min(f + 1, len(values_sorted) - 1)
+    return values_sorted[f] + (values_sorted[c] - values_sorted[f]) * (k - f)
+
+
+def print_detailed_stats(results: list[ExtractionResult], label: str) -> None:
+    n = len(results)
+    successes = [r for r in results if r.success]
+    failures = [r for r in results if not r.success]
+    times = [r.elapsed for r in successes]
+    retries = [r.retries for r in successes]
+    pt_vals = [r.prompt_tokens for r in successes if r.prompt_tokens is not None]
+    et_vals = [r.eval_tokens for r in successes if r.eval_tokens is not None]
+    td_vals = [r.total_duration_ms for r in successes if r.total_duration_ms is not None]
+
+    success_rate = len(successes) / n * 100
+    first_attempt_rate = (n - sum(r.retries for r in successes)) / n * 100
+
+    print(f"\n{'=' * 72}")
+    print(f"  {label}")
+    print(f"{'=' * 72}")
+    print(f"  Inputs:              {n}")
+    print(f"  Success:             {len(successes)}/{n} ({success_rate:.1f}%)")
+    print(f"  Failures:            {len(failures)}/{n} ({100 - success_rate:.1f}%)")
+    print(f"  First-attempt rate:  {first_attempt_rate:.1f}%")
+    print()
+
+    if times:
+        print(f"  Latency (s):")
+        print(f"    min:    {min(times):.3f}")
+        print(f"    p50:    {_pct(times, 50):.3f}")
+        print(f"    p90:    {_pct(times, 90):.3f}")
+        print(f"    p99:    {_pct(times, 99):.3f}")
+        print(f"    max:    {max(times):.3f}")
+        print(f"    mean:   {statistics.mean(times):.3f}")
+        print(f"    stdev:  {statistics.stdev(times):.3f}" if len(times) > 1 else "")
+        print()
+
+    if retries:
+        print(f"  Retries needed:      {sum(retries)} (max {max(retries)} per input)")
+        print()
+
+    if pt_vals:
+        print(f"  Token counts:")
+        print(f"    prompt eval:       {sum(pt_vals)} total, mean {statistics.mean(pt_vals):.0f}")
+        print(f"    eval:              {sum(et_vals)} total, mean {statistics.mean(et_vals):.0f}" if et_vals else "")
+        print(f"    total duration:    {sum(td_vals)/1000:.1f}s total" if td_vals else "")
+        print()
+
+    if failures:
+        print(f"  Failure breakdown:")
+        error_types: dict[str, int] = {}
+        for r in failures:
+            et = r.error_type or "unknown"
+            error_types[et] = error_types.get(et, 0) + 1
+        for et, count in sorted(error_types.items()):
+            print(f"    {et:25s} {count}")
+        print()
+
+    print(f"  Input char lengths:  min {min(r.input_len_chars for r in results)}, "
+          f"max {max(r.input_len_chars for r in results)}, "
+          f"mean {statistics.mean(r.input_len_chars for r in results):.0f}")
+
+    if len(successes) > 1:
+        throughput = len(successes) / sum(times)
+        print(f"  Throughput:          {throughput:.2f} extractions/sec")
+    print()
+
+
+def print_per_input_table(results: list[ExtractionResult], label: str) -> None:
+    print(f"\n  Per-input results ({label}):")
+    print(f"  {'#':>3} {'Status':<6} {'Retries':>7} {'Time (s)':>9} {'Input len':>9} {'Result':<50}")
+    print(f"  {'─'*3} {'─'*6} {'─'*7} {'─'*9} {'─'*9} {'─'*50}")
+    for r in results:
+        status = "OK" if r.success else "FAIL"
+        result_str = f"{r.title} ({r.year})" if r.success else f"{r.error_type or 'error'}"
+        if len(result_str) > 48:
+            result_str = result_str[:45] + "..."
+        print(f"  {r.index:>3} {status:<6} {r.retries:>7} {r.elapsed:>9.3f} {r.input_len_chars:>9} {result_str:<50}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+#  Sample extractor for detailed inspection
+# ---------------------------------------------------------------------------
+
+def show_samples() -> None:
+    schema = Movie.model_json_schema()
+    tricky = [12, 17, 18, 19, 27]
+    print(f"\n{'=' * 70}")
+    print(f"  Sample extractions (model={MODEL_NAME}, backend=urllib)")
+    print(f"{'=' * 70}")
+    for idx in tricky:
+        text = TEST_INPUTS[idx]
+        try:
+            body, content = _call_urllib(text, schema)
+            movie = Movie.model_validate_json(content.strip())
+            pt = body.get("prompt_eval_count", "?")
+            et = body.get("eval_count", "?")
+            print(f"\n  [{idx:2d}] Input:  {text[:70]}")
+            print(f"       Title:   {movie.title}")
+            print(f"       Year:    {movie.year}")
+            print(f"       Genres:  {', '.join(movie.genres)}")
+            print(f"       Summary: {movie.summary[:90]}")
+            print(f"       Tokens:  prompt={pt}, eval={et}")
+        except Exception as e:
+            print(f"\n  [{idx:2d}] Input:  {text[:70]}")
+            print(f"       Error:   {type(e).__name__}: {e}")
+    print()
 
 
 # ---------------------------------------------------------------------------
 #  Runner
 # ---------------------------------------------------------------------------
 
-def show_samples() -> None:
-    """Run a few tricky inputs through urllib and print the extracted Movie objects."""
-    schema = Movie.model_json_schema()
-    tricky = [12, 17, 18, 19, 27]
-    print(f"\nSample extractions (model={MODEL_NAME}, backend=urllib):")
-    print("-" * 70)
-    for idx in tricky:
-        text = TEST_INPUTS[idx]
-        try:
-            payload = {
-                "model": MODEL_NAME,
-                "prompt": _build_prompt(text, schema),
-                "stream": False,
-                "format": schema,
-            }
-            data = json.dumps(payload).encode("utf-8")
-            req = request.Request(OLLAMA_URL, data=data, headers={"Content-Type": "application/json"})
-            with request.urlopen(req) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            content = body.get("response", "").strip()
-            movie = Movie.model_validate_json(content)
-            print(f"[{idx:2d}] Input:  {text[:60]}")
-            print(f"     Title: {movie.title}")
-            print(f"     Year:  {movie.year}")
-            print(f"     Genres: {', '.join(movie.genres)}")
-            print(f"     Summary: {movie.summary[:80]}")
-        except Exception as e:
-            print(f"[{idx:2d}] Input:  {text[:60]}")
-            print(f"     Error: {e}")
-        print()
-
-
 def main() -> None:
+    n = len(TEST_INPUTS)
     backends = [
-        ("urllib        ", run_urllib),
-        ("requests      ", run_requests),
-        ("ollama lib    ", run_ollama_lib),
+        ("urllib        ", _call_urllib),
+        ("requests      ", _call_requests),
+        ("ollama lib    ", _call_ollama_lib),
     ]
 
-    n = len(TEST_INPUTS)
-    print(f"Model: {MODEL_NAME}  |  Iterations per backend: {n}")
-    print(f"{'Backend':<16} {'Success':>8} {'Time (s)':>10} {'Avg (s)':>10}")
-    print("-" * 46)
+    print(f"Model: {MODEL_NAME}  |  Inputs per backend: {n}  |  Max retries: {MAX_RETRIES}")
 
-    results: dict[str, tuple[int, float]] = {}
+    all_results: dict[str, list[ExtractionResult]] = {}
     for label, fn in backends:
-        s, t = fn(TEST_INPUTS)
-        avg = t / s if s else float("inf")
-        results[label.strip()] = (s, t)
-        print(f"{label} {s:>8} {t:>10.2f} {avg:>10.2f}")
+        label_stripped = label.strip()
+        results = _run_backend(TEST_INPUTS, fn, label_stripped)
+        all_results[label_stripped] = results
 
-    total = sum(r[0] for r in results.values())
-    print(f"\nTotal successful extractions across all backends: {total}/{n * 3}")
+    # Summary table
+    print(f"\n{'=' * 72}")
+    print("  SUMMARY")
+    print(f"{'=' * 72}")
+    print(f"  {'Backend':<16} {'Success':>8} {'Total (s)':>11} {'Avg (s)':>9} {'Failures':>9}")
+    print(f"  {'─'*16} {'─'*8} {'─'*11} {'─'*9} {'─'*9}")
+    for label, _ in backends:
+        results = all_results[label.strip()]
+        s = sum(1 for r in results if r.success)
+        t = sum(r.elapsed for r in results)
+        f = n - s
+        avg = t / s if s else float("inf")
+        print(f"  {label} {s:>8} {t:>11.2f} {avg:>9.3f} {f:>9}")
+
+    total_ok = sum(sum(1 for r in results if r.success) for results in all_results.values())
+    print(f"\n  Total successful extractions: {total_ok}/{n * len(backends)}")
+
+    # Detailed stats per backend
+    for label, _ in backends:
+        print_detailed_stats(all_results[label.strip()], label.strip())
+
+    # Per-input table for the first backend
+    first_label = backends[0][0].strip()
+    print_per_input_table(all_results[first_label], first_label)
 
     if os.environ.get("SHOW_SAMPLES"):
         show_samples()

@@ -16,7 +16,7 @@ class Movie(BaseModel):
     summary: str      = Field(..., description="A short one-sentence summary", min_length=1, max_length=500)
 ```
 
-The JSON Schema is generated dynamically from the model via `model_json_schema()` and passed to Ollama's `format` parameter, which constrains the LLM to emit valid JSON matching the schema. Parsed output is then validated with `model_validate_json()`.
+The JSON Schema is generated dynamically from the model via `model_json_schema()` and passed to Ollama's `format` parameter, which constrains the LLM to emit valid JSON matching the schema. Parsed output is validated with `model_validate_json()`.
 
 ### Pydantic v2 features used
 
@@ -90,37 +90,38 @@ SHOW_SAMPLES=1 uv run compare_ollama.py
 
 ## Benchmark results
 
-Benchmarked with `qwen2.5:0.5b` (fast model) across **30 hard edge-case inputs** including:
-- Titles only in director references
-- Years as Roman numerals and spelled-out numbers
-- Multiple movies mentioned (must disambiguate)
-- Non-English text and foreign scripts
-- Text-speak / abbreviations
-- Single-character inputs and impossible extractions
-- Fake/hallucinated movie names
-- Haikus and review-style inputs
+Benchmarked with `qwen2.5:0.5b` across **30 hard edge-case inputs** including Roman numeral years, director-only references, text-speak, Korean/Chinese text, single-character inputs, haikus, fake movies, multi-movie disambiguation, and foreign-script titles.
 
-| Backend | Success | Total time | Avg per call |
+| Backend | Success | Total (s) | Avg (s) | p50 (s) | p90 (s) | p99 (s) | Max (s) | Stdev | Throughput |
+|---|---|---|---|---|---|---|---|---|---|
+| urllib | 30/30 | 12.77 | 0.426 | 0.398 | 0.547 | 0.610 | 0.617 | 0.081 | 2.35/s |
+| requests | 30/30 | 14.31 | 0.477 | 0.445 | 0.583 | 0.778 | 0.786 | 0.104 | 2.10/s |
+| ollama lib | 30/30 | 13.55 | 0.452 | 0.442 | 0.542 | 0.633 | 0.658 | 0.073 | 2.21/s |
+
+**Total: 90/90 successful extractions, 100% first-attempt success rate (0 retries needed).**
+
+### Token statistics
+
+| Backend | Prompt eval tokens | Eval tokens | Total duration |
 |---|---|---|---|
-| urllib | 30/30 | 13.92s | 0.46s |
-| requests | 30/30 | 13.85s | 0.46s |
-| ollama lib | 30/30 | 13.61s | 0.45s |
+| urllib | 12,455 (mean 415) | 2,093 (mean 70) | 12.7s |
+| requests | 12,455 (mean 415) | 2,419 (mean 81) | 14.2s |
+| ollama lib | 12,455 (mean 415) | 2,179 (mean 73) | 13.5s |
 
-**Total: 90/90 successful extractions.**
+All three produce identical prompt token counts (the schema-driven prompt is the same). Eval token counts vary slightly due to LLM nondeterminism. The `ollama` library has the lowest latency stdev (0.073), indicating the most consistent performance.
 
-All three backends achieve identical success rates and comparable performance. The dominant cost is LLM inference time, not HTTP library overhead. Differences of ~0.01s between backends are within measurement noise.
+### Quality observations
 
-### Quality observations (qwen2.5:0.5b on impossible inputs)
+The schema guarantees **structural validity** (valid JSON, all fields present, correct types, within constraints) but **not factual accuracy**. The model fills in missing fields with plausible-sounding values:
 
-The schema guarantees **structural validity** but not **factual accuracy**. The model fills in missing fields with plausible-sounding but fabricated values:
-
-| Input | Model's extraction |
-|---|---|
-| `"1994."` | Title: Unknown, Year: 1994, Genres: Comedy, Drama |
-| `"'"` | Title: The Shawshank Redemption (hallucinated) |
-| `"Dark knight rises once..."` (haiku) | Title: Dark Knight Rises, Year: 2012 (correct) |
-| `"The Zephyrian Protocol" (fake movie)` | Extracted faithfully — it treated the fictional premise as fact |
-| `"Horror."` | Title: Horror, Year: 2018 (fabricated) |
+| Input | Model's extraction | Expected |
+|---|---|---|
+| `"1994."` | Title: The Dark Knight, Year: 1994 | Title: Unknown |
+| `"'"` (single quote) | Title: Movie, Year: 1988 | N/A — impossible |
+| Haiku about Batman | Title: Batman v Superman, Year: 2012 | Title: The Dark Knight Rises |
+| `"The Zephyrian Protocol"` (fake) | Extracted faithfully | Accepted fictional premise |
+| `"Horror."` | Title: Horror, Year: 1980 | Title: Unknown |
+| Director reference (Nolan) | Title: Christopher Nolan | Title: Inception |
 
 For production use, add a **factuality verification** step (e.g., cross-reference with a movie database API) or switch to a higher-quality model like `gemma4:12b`.
 
@@ -141,5 +142,7 @@ All 20 cases pass. The larger model is ~10× slower per call but produces more a
 ```
 main.py            — extraction pipeline with 20 hard edge-case test inputs (gemma4:12b)
 compare_ollama.py  — benchmark comparing urllib, requests, and ollama lib (qwen2.5:0.5b)
+                     features: latency percentiles, token counts, throughput,
+                     per-input breakdown, error categorization, retry tracking
 pyproject.toml     — dependencies and project config (uv-managed)
 ```
