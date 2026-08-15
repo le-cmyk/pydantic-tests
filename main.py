@@ -132,26 +132,65 @@ def get_movie_data(raw_text: str) -> Movie:
 
 def main() -> None:
     test_inputs = [
-        "I just watched 'Inception' - it's a sci-fi heist movie from 2010.",
-        "Just saw 'The Godfather' — a crime drama from 1972 that every aspiring filmmaker should study.",
-        "Last night I caught 'Parasite' on Netflix. It's a 2019 Korean thriller-comedy with incredible social commentary.",
-        "'Pulp Fiction' from 1994 is a nonlinear crime film by Tarantino that changed indie cinema forever.",
-        "Watched 'Spirited Away' yesterday — a 2001 Studio Ghibli animated fantasy masterpiece by Hayao Miyazaki.",
-        "I saw 'Mad Max: Fury Road' last week; a high-octane 2015 action film directed by George Miller.",
-        "'The Dark Knight' (2008) is a superhero film where Heath Ledger's Joker steals the show.",
-        "Just finished 'Everything Everywhere All at Once' — a 2022 absurdist comedy sci-fi multiverse adventure.",
-        "'Forrest Gump' is a 1994 American comedy-drama following a man with a low IQ through pivotal historical events.",
-        "Watched 'Blade Runner 2049' from 2017, a neo-noir sci-fi sequel that's visually stunning.",
-        "I finally saw 'Casablanca' — a 1942 wartime romantic drama that never gets old.",
-        "'The Lord of the Rings: The Fellowship of the Ring' (2001) kicks off Jackson's epic fantasy trilogy.",
-        "Just rewatched 'Fight Club' — David Fincher's 1999 psychological thriller about consumerism and identity.",
-        "'Amélie' is a 2001 French romantic comedy that's whimsical and charming throughout.",
-        "I caught 'Get Out' on a late-night stream. It's Jordan Peele's 2017 horror-comedy social thriller debut.",
-        "'La La Land' (2016) is a modern musical romance that pays homage to classic Hollywood.",
-        "Watched 'The Matrix' from 1999 — a groundbreaking cyberpunk sci-fi action film with innovative visuals.",
-        "'Interstellar' (2014) is Christopher Nolan's space epic about love, time, and survival.",
-        "Just saw 'Moonlight' — a 2016 coming-of-age drama told in three chapters of a young man's life.",
-        "'Arrival' (2016) is a cerebral sci-fi film about linguistics, time, and first contact.",
+        # 0 — multiple movies mentioned, must pick the one in focus
+        "I saw a double feature tonight: first 'The Matrix' from 1999, then 'The Matrix Reloaded' in 2003 — both sci-fi action flicks that blow minds with bullet-time choreography.",
+
+        # 1 — no title at all, only plot description
+        "A washed-up boxer in Philadelphia trains for a final fight against his nemesis Ivan Drago, who killed his friend Apollo Creed — it's Rocky's fourth outing, a 1985 sports drama.",
+
+        # 2 — ambiguous / contradictory year cues
+        "They said 'Back to the Future' was made in 1986 but it's about time travel to both 1955 and 2015 — the actual film is 1985, a sci-fi comedy adventure.",
+
+        # 3 — title appears only in a subtitle, year implied
+        "That Pixar film where the robot WALL-E falls in love and cleans up Earth — 2008, animated post-apocalyptic romance comedy.",
+
+        # 4 — colloquial, year as a range
+        "Caught an old kung fu movie from the early 70s — you know the one, 'Enter the Dragon' with Brubeck's music? 1973, martial arts action.",
+
+        # 5 — non-English original title
+        "Saw '도시폭격' ('The Wailing') on a Korean horror stream last night — 2016, folk horror mystery thriller.",
+
+        # 6 — title with numbers and special chars
+        "The 2010 film '127 Hours' is Danny Boyle's survival biographical drama where a hiker amputates his own arm.",
+
+        # 7 — title embedded in a sentence, no quotes
+        "That 2014 Christopher Nolan movie Interstellar explores relativity and love across dimensions as Cooper pilots a team through a wormhole.",
+
+        # 8 — very short / minimal info
+        "Casablanca.",
+
+        # 9 — very long summary, must be condensed to one sentence
+        "Citizen Kane, Orson Welles' 1941 masterpiece, tells the story of Charles Foster Kane, a wealthy newspaper tycoon whose life is examined after his death through the investigation of his mysterious last word 'Rosebud', exploring themes of power, corruption, and the American Dream through revolutionary cinematography and narrative structure.",
+
+        # 10 — genre is implied, not stated
+        "The 2017 film Get Out follows a Black photographer who visits his white girlfriend's family estate and discovers they're harvesting Black bodies — it's Jordan Peele's directorial debut.",
+
+        # 11 — title in a foreign language with English translation
+        "Watched '라라랜드' (La La Land, 2016) — a modern jazz musical romance that pays homage to classic Hollywood and MGM musicals.",
+
+        # 12 — year is wrong / red herring
+        "Everyone thinks 'Titanic' is about the 1996 film, but the 1997 James Cameron epic actually tells the story of the doomed 1912 ship, blending romance, disaster, and 3D spectacle.",
+
+        # 13 — title not mentioned, must infer from plot
+        "A young wizard discovers he's famous after receiving a letter to attend a magic school, faces a dark wizard who killed his parents, and learns about sacrifice — that's the 1997 UK fantasy adventure.",
+
+        # 14 — multiple genres mashed together
+        "Shrek (2001) is an animated comedy that parodies Disney fairy tales with Ogre protagonists, featuring Lord Farquaad's obsession with perfect kingdom order and Donkey's wise-cracking sidekick energy.",
+
+        # 15 — informal text-speak
+        "omg u hav 2 c 'The Shining' from 1980 — Jack Nicholson goes insane at the Overlook Hotel n his daughter sees ghosts n Danny rides a tricycle thru blood halls. scary horror psychological thriller.",
+
+        # 16 — title and year in middle of long sentence
+        "I can't even right now, but 'Everything Everywhere All at Once' came out in 2022 and it's this absurdist multiverse comedy sci-fi thing where Michelle Yeoh runs a laundromat and fights alternate selves — mind-blowing stuff.",
+
+        # 17 — year missing, title is obscure
+        "That David Lynch film 'Mulholland Drive' — a neo-noir psychological mystery about an amnesiac woman and a failed actress in Hollywood, with a blue key and a dumpster and a cowboy.",
+
+        # 18 — genres described as emotions/themes, not labels
+        "The 2010 film 'Black Swan' follows Nina, a ballerina consumed by perfection as she transforms into the Black Swan in 'Swan Lake' — dark psychological horror thriller.",
+
+        # 19 — very long title with colon
+        "The Lord of the Rings: The Return of the King (2003) concludes the trilogy as Frodo and Sam struggle to destroy the One Ring in Mordor while armies clash at Minas Tirith — epic fantasy war drama from New Line Cinema.",
     ]
 
     count_success = 0
