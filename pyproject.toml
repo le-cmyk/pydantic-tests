@@ -1,15 +1,18 @@
 [project]
 name = "pydantic-tests"
 version = "1.0.0"
-description = "Benchmark urllib, requests, and ollama-library backends for structured LLM extraction with Pydantic v2 — featuring concurrency, retry logic, real-time progress, and color-coded cross-backend comparison."
+description = "Benchmark urllib, requests, and ollama-library backends for structured LLM extraction with Pydantic v2"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "ollama>=0.6.2",
     "pydantic>=2.13.4",
-    "requests>=2.34.2",
+    "requests>=2.31.0",
     "rich>=15.0.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.1"]
 
 [project.scripts]
 ollama-extract = "ollama_extract.cli:main"
@@ -26,8 +29,7 @@ package = true
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]
 
 [dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-]
+dev = ["pytest>=9.1.1"]

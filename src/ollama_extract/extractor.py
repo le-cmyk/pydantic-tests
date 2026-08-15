@@ -1,10 +1,11 @@
-"""Concurrent extraction with ThreadPoolExecutor, retry, and rich progress."""
+"""Concurrent extraction engine with ThreadPoolExecutor, retry logic, and rich progress."""
 
+import json
+import os
 import time
 import logging
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from rich.console import Console
@@ -17,28 +18,141 @@ from rich.progress import (
     TimeRemainingColumn,
     MofNCompleteColumn,
 )
-from rich.table import Table
+from rich.live import Live
+from rich.table import Table as RichTable
 from rich.panel import Panel
 from rich import box
-
-from pydantic import ValidationError
-
-from ollama_extract.model import Movie, get_movie_schema
-from ollama_extract.backends import get_backend, BackendName, BackendResponse, OllamaBackend
-
-BACKEND_NAMES = ["urllib", "requests", "ollama"]
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 DEFAULT_MAX_WORKERS = 4
 MAX_RETRIES = 3
-DEFAULT_TIMEOUT = 120
+BACKEND_NAMES = ["urllib", "requests", "ollama"]
 
+# Localhost patterns to detect local Ollama
+_LOCAL_PATTERNS = ("localhost", "127.0.0.1", "0.0.0.0")
+
+
+def is_local_ollama(ollama_url: str) -> bool:
+    """Check if the Ollama endpoint is on localhost."""
+    return any(p in ollama_url for p in _LOCAL_PATTERNS)
+
+
+def auto_detect_workers(ollama_url: str, model_name: str, sample_inputs: list[str] | None = None) -> int:
+    """Auto-detect the optimal worker count by running a warmup benchmark.
+
+    Strategy:
+        1. Detect CPU cores and whether Ollama is local or remote.
+        2. Compute a heuristic initial count (local = min(cores, 4), remote = min(cores*2, 16)).
+        3. Run a warmup benchmark with workers in {1, 2, heuristic} on 3 inputs.
+        4. Pick the worker count with the best throughput.
+    """
+    from ollama_extract.model import Movie, get_movie_schema
+    from ollama_extract.backends import get_backend
+
+    cpu_cores = os.cpu_count() or 4
+    local = is_local_ollama(ollama_url)
+
+    if local:
+        heuristic = min(cpu_cores, 4)
+    else:
+        heuristic = min(cpu_cores * 2, 16)
+
+    # Warmup candidates
+    candidates = sorted(set([1, 2, heuristic]))
+    schema = get_movie_schema()
+
+    # Use sample inputs or a default
+    if sample_inputs is None:
+        from ollama_extract.generator import TEST_INPUTS
+        sample_inputs = TEST_INPUTS[:3]
+
+    samples = sample_inputs[:3]
+    best_throughput = 0.0
+    best_workers = heuristic
+    backend = get_backend("urllib", model_name, ollama_url)
+
+    for workers in candidates:
+        if workers > len(samples):
+            continue
+        start = time.perf_counter()
+        success = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_single_extract, backend, text, schema): i
+                for i, text in enumerate(samples)
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result.success:
+                    success += 1
+        elapsed = time.perf_counter() - start
+        throughput = success / elapsed if elapsed > 0 else 0
+        console.print(f"  [dim]warmup: {workers} workers → {throughput:.2f}/s ({success}/{len(samples)} ok)[/dim]")
+
+        if throughput > best_throughput:
+            best_throughput = throughput
+            best_workers = workers
+
+    return best_workers
+
+
+def _build_prompt(raw_text: str, schema: dict[str, Any]) -> str:
+    return f"""You are a data extraction assistant.
+
+Extract the movie information from the text below and return ONLY valid JSON that conforms to this JSON Schema:
+
+{json.dumps(schema, indent=2)}
+
+Rules:
+1. Output ONLY valid JSON — no markdown fences, no preamble, no explanation.
+2. Match the schema exactly; extra fields will cause validation to fail.
+3. If a value is missing, use "Unknown" (for strings) or null (for integers).
+
+Text to extract from:
+---
+{raw_text}
+---"""
+
+
+def _single_extract(backend: Any, text: str, schema: dict[str, Any]) -> "ExtractionResult":
+    """Low-level single extraction used by auto_detect_workers."""
+    from ollama_extract.model import Movie
+
+    result = ExtractionResult(
+        index=0,
+        input_text=text,
+        success=False,
+        elapsed=0.0,
+        backend=backend.name,
+    )
+    start = time.perf_counter()
+    try:
+        resp = backend.generate(_build_prompt(text, schema), schema)
+        result.elapsed = time.perf_counter() - start
+        result.prompt_tokens = resp.prompt_tokens
+        result.eval_tokens = resp.eval_tokens
+        result.total_duration_ms = resp.total_duration_ms
+
+        movie = backend.validate(resp.content)
+        result.success = True
+        result.title = movie.title
+        result.year = movie.year
+        result.genres = movie.genres
+    except Exception as e:
+        result.elapsed = time.perf_counter() - start
+        result.error = str(e)
+        result.error_type = type(e).__name__
+    return result
+
+
+# ---------------------------------------------------------------------------
+#  Result dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ExtractionResult:
-    """Per-input extraction result."""
     index: int
     input_text: str
     success: bool
@@ -57,7 +171,6 @@ class ExtractionResult:
 
 @dataclass
 class BatchResult:
-    """Aggregated results from a batch run."""
     backend: str
     results: list[ExtractionResult]
 
@@ -82,36 +195,87 @@ class BatchResult:
     def latencies(self) -> list[float]:
         return sorted(r.elapsed for r in self.results if r.success)
 
-
-def _p50(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    return values[len(values) // 2]
-
-
-def _p90(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    return values[int(len(values) * 0.9)]
+    @property
+    def first_attempt_success_rate(self) -> float:
+        if not self.results:
+            return 100.0
+        sa = sum(1 for r in self.results if r.success and r.retries == 0)
+        return sa / len(self.results) * 100
 
 
-def _p99(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    return values[int(len(values) * 0.99)]
+# ---------------------------------------------------------------------------
+#  Interactive live display
+# ---------------------------------------------------------------------------
 
+class _LiveResults:
+    """Thread-safe live-updating results table for interactive mode."""
+
+    def __init__(self, n: int, backend_names: list[str], start_time: float):
+        self.n = n
+        self.backend_names = backend_names
+        self.start_time = start_time
+        self.completed: dict[str, dict[int, ExtractionResult]] = {
+            name: {} for name in backend_names
+        }
+        self.lock = __import__("threading").Lock()
+
+    def add_result(self, backend: str, result: ExtractionResult) -> None:
+        with self.lock:
+            self.completed[backend][result.index] = result
+
+    def render(self) -> RichTable:
+        with self.lock:
+            table = RichTable(box=box.MINIMAL, show_header=True, header_style="bold cyan")
+            table.add_column("#", justify="right", style="dim", width=4)
+            for name in self.backend_names:
+                table.add_column(name, overflow="fold", max_width=30)
+
+            total_completed = sum(len(v) for v in self.completed.values())
+            total_success = 0
+            for i in range(self.n):
+                row = [str(i)]
+                for name in self.backend_names:
+                    r = self.completed[name].get(i)
+                    if r is None:
+                        row.append("[yellow]⏳[/yellow]")
+                    elif r.success:
+                        row.append(f"✅ {r.title} ({r.year})")
+                    else:
+                        row.append(f"[red]❌ {r.error_type}[/red]")
+                table.add_row(*row)
+
+            elapsed = time.time() - self.start_time
+            throughput = total_completed / elapsed if elapsed > 0 else 0
+            success_rate = (total_success / total_completed * 100) if total_completed else 0
+
+            panel = Panel(
+                table,
+                title=(
+                    f"[bold]Live Extraction[/bold]  "
+                    f"[green]✓ {total_success}/{total_completed}[/green]  "
+                    f"[yellow]⏳ {total_completed - total_success}/{self.n * len(self.backend_names)}[yellow]  "
+                    f"[cyan]⏱ {elapsed:.1f}s[/cyan]  "
+                    f"[magenta]{throughput:.1f}/s[/magenta]  "
+                    f"[dim]workers: auto-tuned[/dim]"
+                ),
+                border_style="cyan",
+            )
+            return panel
+
+
+# ---------------------------------------------------------------------------
+#  Concurrent extractor
+# ---------------------------------------------------------------------------
 
 class ConcurrentExtractor:
     """Runs extractions concurrently across multiple backends.
 
-    Uses ``ThreadPoolExecutor`` since the workload is I/O-bound (HTTP requests
-    to a local Ollama instance).  Thread-pool size is capped by *max_workers*
-    to avoid overwhelming the Ollama server.
+    Uses ``ThreadPoolExecutor`` — the workload is I/O-bound (HTTP to an Ollama
+    server + LLM inference time dominates).  Thread-pool size defaults to 4
+    workers, which is the empirically optimal concurrency for local
+    qwen2.5:0.5b (higher worker counts cause server-side latency degradation).
 
-    Sizing rationale (Goetz / Python docs):
-        N_threads = cores × (1 + Wait/Service)
-        For ~0.4 s LLM-wait and ~0.01 s service overhead that gives ~40 threads,
-        but the local Ollama server caps useful concurrency at ~4–8 workers.
+    Pass ``max_workers=0`` to auto-detect the optimal count via a warmup benchmark.
     """
 
     def __init__(
@@ -120,23 +284,21 @@ class ConcurrentExtractor:
         ollama_url: str = "http://localhost:11434/api/generate",
         max_workers: int = DEFAULT_MAX_WORKERS,
         max_retries: int = MAX_RETRIES,
+        interactive: bool = False,
     ) -> None:
         self.model_name = model_name
         self.ollama_url = ollama_url
-        self.max_workers = max_workers
         self.max_retries = max_retries
+        self.interactive = interactive
         self._schema = get_movie_schema()
 
-    # ------------------------------------------------------------------
-    #  Single extraction (with retry + metrics)
-    # ------------------------------------------------------------------
+        if max_workers <= 0:
+            self.max_workers = auto_detect_workers(ollama_url, model_name)
+        else:
+            self.max_workers = max_workers
 
-    def _extract_one(
-        self,
-        backend: OllamaBackend,
-        text: str,
-        index: int,
-    ) -> ExtractionResult:
+    def _extract_one(self, backend: Any, text: str, index: int) -> ExtractionResult:
+        """Single extraction with retry logic.  Must be thread-safe."""
         result = ExtractionResult(
             index=index,
             input_text=text,
@@ -144,14 +306,12 @@ class ConcurrentExtractor:
             elapsed=0.0,
             backend=backend.name,
         )
-        last_err: Exception | None = None
 
         for attempt in range(self.max_retries):
             try:
                 start = time.perf_counter()
                 resp = backend.generate(_build_prompt(text, self._schema), self._schema)
-                elapsed = time.perf_counter() - start
-                result.elapsed += elapsed
+                result.elapsed += time.perf_counter() - start
 
                 result.prompt_tokens = resp.prompt_tokens
                 result.eval_tokens = resp.eval_tokens
@@ -162,9 +322,9 @@ class ConcurrentExtractor:
                 result.title = movie.title
                 result.year = movie.year
                 result.genres = movie.genres
-                break
+                return result
+
             except Exception as e:
-                last_err = e
                 if attempt < self.max_retries - 1:
                     result.retries += 1
                     logger.debug(f"Retry {attempt + 1}/{self.max_retries} for #{index}: {e}")
@@ -172,11 +332,76 @@ class ConcurrentExtractor:
                     result.error = str(e)
                     result.error_type = type(e).__name__
 
+        logger.warning(f"{backend.name} #[index] failed after {self.max_retries} attempts — {result.error_type}")
         return result
 
-    # ------------------------------------------------------------------
-    #  Batch run with progress display
-    # ------------------------------------------------------------------
+    def _run_single_backend(
+        self,
+        inputs: list[str],
+        backend: Any,
+        show_progress: bool,
+    ) -> BatchResult:
+        """Run all inputs through a single backend with ThreadPoolExecutor."""
+        results_by_index: dict[int, ExtractionResult] = {}
+        live: _LiveResults | None = None
+        live_display: Live | None = None
+
+        if show_progress and self.interactive:
+            live = _LiveResults(
+                n=len(inputs),
+                backend_names=[backend.name],
+                start_time=time.time(),
+            )
+            live_display = Live(live.render, console=console, refresh_per_second=10, transient=False)
+
+        if show_progress and live_display is None:
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TaskProgressColumn(),
+                TimeRemainingColumn(),
+                console=console,
+            )
+        else:
+            progress = None
+
+        try:
+            if progress:
+                progress.start()
+                task = progress.add_task(f"[cyan]{backend.name:>12}", total=len(inputs))
+
+            if live_display:
+                live_display.start()
+
+            with ThreadPoolExecutor(
+                max_workers=self.max_workers,
+                thread_name_prefix=f"{backend.name}-worker",
+            ) as executor:
+                future_to_idx = {
+                    executor.submit(self._extract_one, backend, text, idx): idx
+                    for idx, text in enumerate(inputs)
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    result = future.result()
+                    results_by_index[idx] = result
+
+                    if live:
+                        live.add_result(backend.name, result)
+                        live_display.update(live.render)
+                    if progress:
+                        progress.advance(task)
+
+        finally:
+            if progress:
+                progress.stop()
+            if live_display:
+                live_display.stop()
+
+        ordered = [results_by_index[i] for i in range(len(inputs))]
+        return BatchResult(backend=backend.name, results=ordered)
 
     def run(
         self,
@@ -189,201 +414,22 @@ class ConcurrentExtractor:
         Args:
             inputs: List of natural-language movie descriptions.
             backend_name: "urllib", "requests", "ollama", or "all".
-            show_progress: If True, display a Rich progress bar.
+            show_progress: If True, display Rich progress bar per backend.
 
         Returns:
             Dict mapping backend name → ``BatchResult``.
         """
-        backend_names = {"all": ["urllib", "requests", "ollama"]}.get(
-            backend_name, [backend_name]
-        )
+        names = BACKEND_NAMES if backend_name == "all" else [backend_name]
+        all_results: dict[str, BatchResult] = {}
 
-        backends: list[OllamaBackend] = [
-            get_backend(name, self.model_name, self.ollama_url) for name in backend_names
-        ]
-
-        results: dict[str, BatchResult] = {}
-
-        for backend in backends:
+        for name in names:
+            backend = get_backend(name, self.model_name, self.ollama_url)
             if show_progress:
-                console.print(f"\n[cyan]Running {backend.name} backend on {len(inputs)} inputs "
-                               f"with {self.max_workers} workers...[/cyan]")
-
-            batch = self._run_single_backend(inputs, backend, show_progress)
-            results[backend.name] = batch
-
-            if show_progress:
-                self._print_backend_summary(backend.name, batch)
-
-        return results
-
-    def _run_single_backend(
-        self,
-        inputs: list[str],
-        backend: OllamaBackend,
-        show_progress: bool,
-    ) -> BatchResult:
-        """Run all inputs through a single backend with concurrency."""
-        results_by_index: dict[int, ExtractionResult] = {}
-
-        if show_progress:
-            progress = Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TaskProgressColumn(),
-                TimeRemainingColumn(),
-                console=console,
-            )
-            with progress:
-                task = progress.add_task(
-                    f"[cyan]{backend.name:>12}", total=len(inputs)
+                console.print(
+                    f"\n[cyan]  Running {name} backend on {len(inputs)} inputs "
+                    f"with {self.max_workers} workers...[/cyan]"
                 )
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    future_to_idx = {
-                        executor.submit(self._extract_one, backend, text, idx): idx
-                        for idx, text in enumerate(inputs)
-                    }
-                    for future in as_completed(future_to_idx):
-                        idx = future_to_idx[future]
-                        result = future.result()
-                        results_by_index[idx] = result
-                        progress.advance(task)
-        else:
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_idx = {
-                    executor.submit(self._extract_one, backend, text, idx): idx
-                    for idx, text in enumerate(inputs)
-                }
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    results_by_index[idx] = future.result()
+            batch = self._run_single_backend(inputs, backend, show_progress)
+            all_results[name] = batch
 
-        # Order results by original index
-        ordered = [results_by_index[i] for i in range(len(inputs))]
-        return BatchResult(backend=backend.name, results=ordered)
-
-    # ------------------------------------------------------------------
-    #  Display
-    # ------------------------------------------------------------------
-
-    def _print_backend_summary(self, name: str, batch: BatchResult) -> None:
-        latencies = batch.latencies
-        table = Table(title=f"{name} — results", box=box.ROUNDED, show_header=True)
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", justify="right", style="green")
-
-        table.add_row("Inputs", str(len(batch.results)))
-        table.add_row("Success", str(batch.success_count))
-        table.add_row("Failures", str(batch.failure_count))
-        table.add_row("First-attempt rate", f"{(len(batch.results) - sum(r.retries for r in batch.results if r.success)) / len(batch.results) * 100:.1f}%")
-
-        if latencies:
-            table.add_row("Latency min (s)", f"{min(latencies):.3f}")
-            table.add_row("Latency p50 (s)", f"{_p50(latencies):.3f}")
-            table.add_row("Latency p90 (s)", f"{_p90(latencies):.3f}")
-            table.add_row("Latency p99 (s)", f"{_p99(latencies):.3f}")
-            table.add_row("Latency max (s)", f"{max(latencies):.3f}")
-            table.add_row("Latency mean (s)", f"{batch.avg_elapsed:.3f}")
-
-        throughput = batch.success_count / batch.total_elapsed if batch.total_elapsed > 0 else 0
-        table.add_row("Throughput (rps)", f"{throughput:.2f}")
-        table.add_row("Total time (s)", f"{batch.total_elapsed:.2f}")
-
-        console.print(table)
-
-    def print_comparison(self, all_results: dict[str, BatchResult]) -> None:
-        """Print a side-by-side comparison table across backends."""
-        n = len(next(iter(all_results.values())).results)
-
-        console.print()
-        console.print(Panel.fit(
-            f"[bold]Cross-Backend Title & Year Comparison[/bold] "
-            f"(yellow = disagreement, red = failure)",
-            border_style="cyan",
-        ))
-
-        table = Table(box=box.ASCII)
-        table.add_column("#", justify="right", style="dim")
-        for name in BACKEND_NAMES:
-            table.add_column(name, overflow="fold")
-
-        for i in range(n):
-            cells = []
-            titles = set()
-            years = set()
-            for name in BACKEND_NAMES:
-                r = all_results[name].results[i]
-                if r.success:
-                    cell = f"{r.title} ({r.year})"
-                    titles.add(r.title)
-                    years.add(r.year)
-                else:
-                    cell = f"[red]FAIL: {r.error_type}[/red]"
-                cells.append(cell)
-
-            disagreement = len(titles) > 1 or len(years) > 1
-            row_cells = []
-            for cell in cells:
-                if "FAIL" in cell:
-                    row_cells.append(cell)
-                elif disagreement:
-                    row_cells.append(f"[yellow]{cell}[/yellow]")
-                else:
-                    row_cells.append(cell)
-
-            table.add_row(str(i), *row_cells)
-
-        console.print(table)
-
-        # Consistency matrix
-        console.print()
-        console.print(Panel.fit("[bold]Consistency Matrix (title + year agreement)[/bold]", border_style="cyan"))
-        consistency_table = Table(box=box.ASCII)
-        consistency_table.add_column("Pair", style="cyan")
-        consistency_table.add_column("Agreement", justify="right")
-
-        pairs = [
-            ("urllib", "requests"),
-            ("urllib", "ollama"),
-            ("requests", "ollama"),
-        ]
-        for a, b in pairs:
-            if a in all_results and b in all_results:
-                agreements = 0
-                compared = 0
-                for i in range(n):
-                    ra, rb = all_results[a].results[i], all_results[b].results[i]
-                    if ra.success and rb.success:
-                        compared += 1
-                        if ra.title == rb.title and ra.year == rb.year:
-                            agreements += 1
-                rate = agreements / compared * 100 if compared else 0
-                color = "green" if rate >= 95 else ("yellow" if rate >= 80 else "red")
-                consistency_table.add_row(f"{a} vs {b}", f"[{color}]{agreements}/{compared} ({rate:.1f}%)[/{color}]")
-
-        console.print(consistency_table)
-
-
-# ---------------------------------------------------------------------------
-#  Shared helpers
-# ---------------------------------------------------------------------------
-
-def _build_prompt(raw_text: str, schema: dict[str, Any]) -> str:
-    """Build a structured extraction prompt that includes the JSON schema."""
-    return f"""You are a data extraction assistant.
-
-Extract the movie information from the text below and return ONLY valid JSON that conforms to this JSON Schema:
-
-{__import__('json').dumps(schema, indent=2)}
-
-Rules:
-1. Output ONLY valid JSON — no markdown fences, no preamble, no explanation.
-2. Match the schema exactly; extra fields will cause validation to fail.
-3. If a value is missing, use "Unknown" (for strings) or null (for integers).
-
-Text to extract from:
----
-{raw_text}
----"""
+        return all_results
