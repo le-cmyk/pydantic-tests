@@ -78,14 +78,32 @@ Requires a local Ollama instance. Two models are supported — `qwen2.5:0.5b` (f
 ollama pull qwen2.5:0.5b    # fast model for benchmarking
 ollama pull gemma4:12b      # higher-quality model
 
-uv run main.py              # 30 hard edge-case extractions with gemma4:12b
-uv run compare_ollama.py    # benchmark all three backends (uses qwen2.5:0.5b by default)
+# Default: 30 hand-crafted edge-case inputs
+uv run compare_ollama.py
+
+# Generate 3000 programmatically diverse inputs
+uv run compare_ollama.py --count 3000
 
 # Use a different model:
-OLLAMA_MODEL=gemma4:12b uv run compare_ollama.py
+OLLAMA_MODEL=gemma4:12b uv run compare_ollama.py --count 50
 
 # Show sample extractions on tricky inputs:
 SHOW_SAMPLES=1 uv run compare_ollama.py
+```
+
+### `--count` flag
+
+| Count | Source |
+|---|---|
+| ≤ 30 (default) | Hand-crafted edge-cases (Roman numerals, text-speak, haikus, fake movies, etc.) |
+| > 30 | Programmatically generated inputs using 13 diverse templates (standard, director-ref, URL-style, text-speak, review, no-title, Roman numeral, contradictory, haiku, minimal, fake movie, multiple-movies, foreign-mixed) with a seeded RNG for reproducibility |
+
+### `--seed` flag
+
+Default `42`. Controls which generated inputs are produced, so results are reproducible:
+
+```bash
+uv run compare_ollama.py --count 3000 --seed 123
 ```
 
 ## Benchmark results
@@ -99,6 +117,32 @@ Benchmarked with `qwen2.5:0.5b` across **30 hard edge-case inputs** including Ro
 | ollama lib | 30/30 | 13.55 | 0.452 | 0.442 | 0.542 | 0.633 | 0.658 | 0.073 | 2.21/s |
 
 **Total: 90/90 successful extractions, 100% first-attempt success rate (0 retries needed).**
+
+### Cross-backend consistency
+
+The schema constrains all backends to produce valid JSON, but the LLM is nondeterministic — different backends produce different results for ambiguous inputs:
+
+| Backends compared | Title + year agreement |
+|---|---|
+| urllib vs requests | 53.3% |
+| urllib vs ollama lib | 56.7% |
+| requests vs ollama lib | 56.7% |
+
+Agreement is highest on unambiguous inputs (all backends agree on explicit title+year) and lowest on edge cases (single-character inputs, director-only references, contradictory years, missing titles).
+
+### Per-input title & year comparison (first 5)
+
+When running in a terminal, differences are color-coded:
+- **Yellow** — backends disagree on title or year
+- **Red** — backend failed
+
+| # | urllib | requests | ollama lib |
+|---|---|---|---|
+| 0 | Amélie (2001) | Amélie (2001) | Amélie (2001) |
+| 1 | The Dark Knight (2010) | Dream Invasion (2010) | Dream Invasion (2010) |
+| 2 | Unknown (1994) | Pulp Fiction (1994) | Pulp Fiction (1994) |
+| 3 | The Shining (1980) | The Shining (1980) | The Shining (1980) |
+| 4 | Reality Is An Illusion (1999) | Red Pill (1999) | A 1999 Sci-Fi Action Film (1999) |
 
 ### Token statistics
 

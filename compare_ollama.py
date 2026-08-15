@@ -3,11 +3,19 @@
 Each backend performs the same extraction task (Movie model) and supports
 JSON-schema structured output.  Results are printed in comparison tables
 with color-coded differences.
+
+Usage:
+    uv run compare_ollama.py                    # 30 hand-crafted edge-cases
+    uv run compare_ollama.py --count 3000       # 3000 programmatically generated inputs
+    OLLAMA_MODEL=gemma4:12b uv run compare_ollama.py --count 50
+    SHOW_SAMPLES=1 uv run compare_ollama.py     # also show sample extractions
 """
 
+import argparse
 import json
 import os
 import time
+import random
 import logging
 import statistics
 from dataclasses import dataclass, field
@@ -35,28 +43,8 @@ USE_COLOR = sys.stdout.isatty() if (sys := __import__("sys")) else False
 
 
 # ---------------------------------------------------------------------------
-#  ANSI colors
-# ---------------------------------------------------------------------------
-
-class C:
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    CYAN = "\033[96m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
-
-
-def _c(text: str, color: str) -> str:
-    if not USE_COLOR:
-        return text
-    return f"{color}{text}{C.RESET}"
-
-
-# ---------------------------------------------------------------------------
-#  Test inputs — 30 hard edge-cases
+#  Hand-crafted edge-case inputs (default test suite; replaced by generated
+#  inputs when --count > len(TEST_INPUTS))
 # ---------------------------------------------------------------------------
 
 TEST_INPUTS = [
@@ -81,7 +69,7 @@ TEST_INPUTS = [
     #  9 — text-speak / abbreviations
     "lmao 'Get Out' 2017 best horror social thriller everrr jordan peele killed it.",
     # 10 — non-English description, English title
-    "이 영화 '인셉션' 2010 년 작품은 드림 속에서 비밀을 훔치는 팀을 보여줘요. sci-fi heist.",
+    "이 영화 '인셍' 2010 년 작품은 드림 속에서 비밀을 훔치는 팀을 보여줘요. sci-fi heist.",
     # 11 — genre as single-word emotions
     "That 2012 film 'Argo' feels like suspense, tension, and nervous anxiety wrapped in a CIA thriller.",
     # 12 — nothing but a year (impossible extraction)
@@ -121,6 +109,232 @@ TEST_INPUTS = [
     # 29 — contradictory years + no explicit title
     "That film from 2010, no wait 2011, the Christopher Nolan one about dreams within dreams with a spinning top — release year is 2010.",
 ]
+
+
+# ---------------------------------------------------------------------------
+#  ANSI colors
+# ---------------------------------------------------------------------------
+
+class C:
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+
+def _c(text: str, color: str) -> str:
+    if not USE_COLOR:
+        return text
+    return f"{color}{text}{C.RESET}"
+
+
+# ---------------------------------------------------------------------------
+#  Test input generation
+# ---------------------------------------------------------------------------
+
+REAL_TITLES = [
+    "Inception", "The Godfather", "Pulp Fiction", "The Dark Knight", "Fight Club",
+    "Forrest Gump", "The Matrix", "Interstellar", "Spirited Away", "Amélie",
+    "Casablanca", "The Lord of the Rings: The Fellowship of the Ring",
+    "The Lord of the Rings: The Two Towers", "The Lord of the Rings: The Return of the King",
+    "Mad Max: Fury Road", "The Shawshank Redemption", "The Prestige", "Memento",
+    "The Departed", "There Will Be Blood", "No Country for Old Men", "There",
+    "Her", "Moonlight", "Arrival", "Blade Runner 2049", "La La Land",
+    "Get Out", "Us", "Black Panther", "Parasite", "1917", "Joker", "Dune",
+    "Everything Everywhere All at Once", "The Whale", "Avatar: The Way of Water",
+    "Top Gun: Maverick", "Elvis", "The Batman", "Doctor Strange in the Multiverse of Madness",
+    "Spider-Man: No Way Home", "Dune: Part Two", "Oppenheimer", "Barbie",
+    "Guardians of the Galaxy", "The Revenant", "The Social Network", "The King's Speech",
+]
+
+FAKE_TITLES = [
+    "The Zephyrian Protocol", "Quantum Paradox", "The Crimson Void",
+    "Echoes of Yesterday", "The Last Horizon", "Project Nebula",
+    "Shadow of the Colossus", "The Eternal Circuit", "Neon Genesis",
+]
+
+PLOTS = [
+    "a thief who steals secrets from dreams",
+    "a botanist who discovers a mysterious plant with deadly consequences",
+    "a detective who hunts a serial killer copycat",
+    "a young lion prince who must embrace his destiny",
+    "a hacker who learns reality is an illusion",
+    "a scientist who invents a time machine",
+    "a retired assassin who comes out of retirement",
+    "a journalist who uncovers a conspiracy",
+    "a teacher who discovers a student's dark secret",
+    "a pilot who must deliver humanity's last hope",
+    "a musician who loses his hearing and finds a new voice",
+    "a mother who seeks justice for her family",
+    "a scientist who creates artificial life",
+    "a thief who steals memories",
+    "a detective who can see the dead",
+    "a young witch who must choose between love and duty",
+]
+
+GENRE_DESCRIPTIONS = [
+    "sci-fi", "crime", "drama", "action", "horror", "comedy", "thriller",
+    "fantasy", "romance", "mystery", "adventure", "animation", "western",
+    "war", "musical", "documentary", "biography", "history",
+]
+
+YEAR_STRINGS = [
+    "2010", "1994", "2001", "2017", "1997", "1977", "1999", "2008",
+    "1942", "1972", "1985", "2012", "2013", "2016", "1996", "2014",
+    "two thousand and one", "nineteen ninety-four", "MMX", "MCMLXIV",
+]
+
+ROMAN_NUMERALS = {
+    "1942": "MCMXLII", "1972": "MCMLXXII", "1977": "MCMLXXVII", "1985": "MCMLXXXV",
+    "1994": "MCMXCIV", "1996": "MCMXCVI", "1997": "MCMXCVII", "1999": "MCMXCIX",
+    "2001": "MMI", "2010": "MMX", "2012": "MMXII", "2013": "MMXIII",
+    "2014": "MMXIV", "2016": "MMXVI", "2017": "MMXVII",
+}
+
+DIRECTORS = [
+    "Christopher Nolan", "Quentin Tarantino", "Steven Spielberg", "Martin Scorsese",
+    "Ridley Scott", "James Cameron", "David Fincher", "The Coen Brothers",
+    "Hayao Miyazaki", "Denis Villeneuve", "Greta Gerwig", "Jordan Peele",
+    "Bong Joon-ho", "Chloé Zhao", "Taika Waititi",
+]
+
+CRITICS = ["Roger Ebert", "Peter Travers", "A.O. Scott", "Richard Roeper", "Owen Gleiberman", "Kenneth Turan"]
+
+
+def _gen_standard(rng: random.Random) -> str:
+    title = rng.choice(REAL_TITLES + FAKE_TITLES)
+    year = rng.choice(YEAR_STRINGS)
+    genre = rng.choice(GENRE_DESCRIPTIONS)
+    plot = rng.choice(PLOTS)
+    return f"I just watched '{title}' — it's a {year} {genre} film about {plot}."
+
+
+def _gen_director(rng: random.Random) -> str:
+    director = rng.choice(DIRECTORS)
+    year = rng.choice(YEAR_STRINGS)
+    plot = rng.choice(PLOTS)
+    return f"That {director} {year} film where {plot} — you know the one."
+
+
+def _gen_url_style(rng: random.Random) -> str:
+    title = rng.choice(REAL_TITLES)
+    year = rng.choice(YEAR_STRINGS)
+    slug = title.lower().replace(" ", "-").replace(":", "").replace("'", "")
+    return f"I found a file: {slug}-{year}-dvdrip.mkv — pretty sure that's the right movie?"
+
+
+def _gen_text_speak(rng: random.Random) -> str:
+    title = rng.choice(REAL_TITLES)
+    year = rng.choice(YEAR_STRINGS)
+    genre = rng.choice(GENRE_DESCRIPTIONS)
+    return f"omg just saw '{title}' {year} so {genre} rn best movie ever lol"
+
+
+def _gen_review(rng: random.Random) -> str:
+    critic = rng.choice(CRITICS)
+    title = rng.choice(REAL_TITLES + FAKE_TITLES)
+    year = rng.choice(YEAR_STRINGS)
+    genre = rng.choice(GENRE_DESCRIPTIONS)
+    return f"As {critic} said, '{title}' ({year}) is a {genre} masterpiece."
+
+
+def _gen_no_title(rng: random.Random) -> str:
+    year = rng.choice(YEAR_STRINGS)
+    genre = rng.choice(GENRE_DESCRIPTIONS)
+    plot = rng.choice(PLOTS)
+    return f"A {year} {genre} film about {plot}."
+
+
+def _gen_roman_year(rng: random.Random) -> str:
+    title = rng.choice(REAL_TITLES)
+    year_key = rng.choice(list(ROMAN_NUMERALS.keys()))
+    roman = ROMAN_NUMERALS[year_key]
+    return f"That {year_key} film '{title}' ({roman}) — a must-see."
+
+
+def _gen_contradictory(rng: random.Random) -> str:
+    title = rng.choice(REAL_TITLES)
+    y1 = rng.choice(YEAR_STRINGS)
+    y2 = rng.choice(YEAR_STRINGS)
+    while y2 == y1:
+        y2 = rng.choice(YEAR_STRINGS)
+    return f"I saw '{title}' in {y1}... no wait, it was actually {y2}."
+
+
+def _gen_haiku(rng: random.Random) -> str:
+    title = rng.choice(REAL_TITLES)
+    year = rng.choice(YEAR_STRINGS)
+    return f"{title[:5]} whispers in silence, {year} cinema defines art, masterpiece seen."
+
+
+def _gen_minimal(rng: random.Random) -> str:
+    option = rng.randint(0, 3)
+    if option == 0:
+        return rng.choice(YEAR_STRINGS) + "."
+    if option == 1:
+        return "'"
+    if option == 2:
+        return rng.choice(GENRE_DESCRIPTIONS) + "."
+    title = rng.choice(REAL_TITLES)
+    return title
+
+
+def _gen_fake_movie(rng: random.Random) -> str:
+    title = rng.choice(FAKE_TITLES)
+    year = rng.choice(YEAR_STRINGS)
+    genre = rng.choice(GENRE_DESCRIPTIONS)
+    plot = rng.choice(PLOTS)
+    return f"I just watched '{title}' from {year} — a {genre} film about {plot} that does not exist."
+
+
+def _gen_multiple_movies(rng: random.Random) -> str:
+    t1 = rng.choice(REAL_TITLES)
+    t2 = rng.choice(REAL_TITLES)
+    while t2 == t1:
+        t2 = rng.choice(REAL_TITLES)
+    target = rng.choice(REAL_TITLES + FAKE_TITLES)
+    year = rng.choice(YEAR_STRINGS)
+    return f"Like '{t1}' and '{t2}', '{target}' ({year}) is the one that stands out."
+
+
+def _gen_foreign_mixed(rng: random.Random) -> str:
+    title = rng.choice(REAL_TITLES)
+    year = rng.choice(YEAR_STRINGS)
+    phrases_ko = ["이 영화", "이제야 봤어", "정말 좋은 영화", "추천해요"]
+    phrases_zh = ["看过", "真的很好看", "强烈推荐", "这是一部"]
+    phrase = rng.choice(phrases_ko + phrases_zh)
+    return f"{phrase} '{title}' {year} — a truly unforgettable film."
+
+
+_GENERATORS = [
+    _gen_standard,
+    _gen_director,
+    _gen_url_style,
+    _gen_text_speak,
+    _gen_review,
+    _gen_no_title,
+    _gen_roman_year,
+    _gen_contradictory,
+    _gen_haiku,
+    _gen_minimal,
+    _gen_fake_movie,
+    _gen_multiple_movies,
+    _gen_foreign_mixed,
+]
+
+
+def generate_inputs(n: int, seed: int = 42) -> list[str]:
+    """Generate *n* diverse movie-extraction test inputs using a seeded RNG."""
+    rng = random.Random(seed)
+    inputs = []
+    for _ in range(n):
+        gen = rng.choice(_GENERATORS)
+        inputs.append(gen(rng))
+    return inputs
 
 
 # ---------------------------------------------------------------------------
@@ -392,10 +606,8 @@ def print_title_year_comparison(all_results: dict[str, list[ExtractionResult]]) 
     )
     print(_c(header, C.BOLD))
     print(f"  {'─'*3}  {'─'*46}  {'─'*46}  {'─'*46}")
-
     for i in range(n):
         cells = []
-        disagreements = []
         for name in BACKEND_NAMES:
             r = all_results[name][i]
             if r.success:
@@ -404,8 +616,7 @@ def print_title_year_comparison(all_results: dict[str, list[ExtractionResult]]) 
                 cell = f"FAIL: {r.error_type}"
             cells.append(cell)
 
-        # Check disagreement across successful results
-        titles = {c.split(" (")[0] for c in cells if "FAIL" not in c and cell is not None}
+        titles = {c.split(" (")[0] for c in cells if "FAIL" not in c}
         years = set()
         for c in cells:
             if "FAIL" not in c and "(" in c:
@@ -501,13 +712,14 @@ def print_consistency_matrix(all_results: dict[str, list[ExtractionResult]]) -> 
 
 def print_error_summary(all_results: dict[str, list[ExtractionResult]]) -> None:
     """Summarize any failures across all backends."""
+    n = len(next(iter(all_results.values())))
     total_errors = 0
     for name in BACKEND_NAMES:
         errors = [r for r in all_results[name] if not r.success]
         total_errors += len(errors)
 
     if total_errors == 0:
-        print(f"\n  {_c('No errors across any backend — all 90 extractions succeeded.', C.GREEN)}")
+        print(f"\n  {_c(f'No errors across any backend — all {n * len(BACKEND_NAMES)} extractions succeeded.', C.GREEN)}")
         return
 
     print(f"\n  {_c(f'{total_errors} total errors across all backends:', C.RED)}")
@@ -523,60 +735,18 @@ def print_error_summary(all_results: dict[str, list[ExtractionResult]]) -> None:
 #  Runner
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    n = len(TEST_INPUTS)
-    backends = [
-        ("urllib", _call_urllib),
-        ("requests", _call_requests),
-        ("ollama lib", _call_ollama_lib),
-    ]
-
-    print(f"Model: {MODEL_NAME}  |  Inputs per backend: {n}  |  Max retries: {MAX_RETRIES}")
-
-    all_results: dict[str, list[ExtractionResult]] = {}
-    for label, fn in backends:
-        results = _run_backend(TEST_INPUTS, fn, label)
-        all_results[label] = results
-
-    # --- Summary table ---
-    print(f"\n{'=' * 72}")
-    print("  SUMMARY")
-    print(f"{'=' * 72}")
-    print(f"  {'Backend':<16} {'Success':>8} {'Total (s)':>11} {'Avg (s)':>9} {'Failures':>9}")
-    print(f"  {'─'*16} {'─'*8} {'─'*11} {'─'*9} {'─'*9}")
-    for label, _ in backends:
-        results = all_results[label]
-        s = sum(1 for r in results if r.success)
-        t = sum(r.elapsed for r in results)
-        f = n - s
-        avg = t / s if s else float("inf")
-        print(f"  {label:<16} {s:>8} {t:>11.2f} {avg:>9.3f} {f:>9}")
-
-    total_ok = sum(sum(1 for r in results if r.success) for results in all_results.values())
-    print(f"\n  Total successful extractions: {total_ok}/{n * len(backends)}")
-
-    # --- Detailed stats per backend ---
-    for label, _ in backends:
-        print_detailed_stats(all_results[label], label)
-
-    # --- Cross-backend comparison tables ---
-    print_title_year_comparison(all_results)
-    print_timing_comparison(all_results)
-    print_consistency_matrix(all_results)
-    print_error_summary(all_results)
-
-    if os.environ.get("SHOW_SAMPLES"):
-        show_samples(all_results)
-
-
-def show_samples(all_results: dict[str, list[ExtractionResult]]) -> None:
-    schema = Movie.model_json_schema()
-    tricky = [12, 17, 18, 19, 27]
+def show_samples(all_results: dict[str, list[ExtractionResult]], test_inputs: list[str]) -> None:
+    n = len(test_inputs)
+    if n <= 10:
+        tricky = list(range(n))
+    else:
+        tricky = [12, 17, 18, 19, 27, 0, 5, n - 1]
+    tricky = [i for i in tricky if i < n]
     print(f"\n{'=' * 70}")
     print(f"  Sample extractions (model={MODEL_NAME})")
     print(f"{'=' * 70}")
     for idx in tricky:
-        text = TEST_INPUTS[idx]
+        text = test_inputs[idx]
         for name in BACKEND_NAMES:
             r = all_results[name][idx]
             if r.success:
@@ -589,6 +759,93 @@ def show_samples(all_results: dict[str, list[ExtractionResult]]) -> None:
                 print(f"\n  [{idx:2d}] {name:>12} | Input: {text[:60]}")
                 print(f"       Error:   {r.error_type}: {r.error}")
     print()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Benchmark urllib vs requests vs ollama for structured LLM extraction.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  uv run compare_ollama.py                    # 30 hard edge-case inputs (default)
+  uv run compare_ollama.py --count 3000      # 3000 programmatically generated inputs
+  OLLAMA_MODEL=gemma4:12b uv run compare_ollama.py --count 50
+  SHOW_SAMPLES=1 uv run compare_ollama.py    # also show sample extractions
+""",
+    )
+    parser.add_argument(
+        "--count", "-n",
+        type=int,
+        default=len(TEST_INPUTS),
+        help=f"Number of test inputs (default: {len(TEST_INPUTS)}). "
+             f"Values > {len(TEST_INPUTS)} generate inputs programmatically.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for generated inputs (default: 42)",
+    )
+    args = parser.parse_args()
+
+    if args.count <= len(TEST_INPUTS):
+        test_inputs = TEST_INPUTS[:args.count]
+        source = "hand-crafted edge-cases"
+    else:
+        test_inputs = generate_inputs(args.count, seed=args.seed)
+        source = f"programmatically generated (seed={args.seed})"
+
+    n = len(test_inputs)
+    backends = [
+        ("urllib", _call_urllib),
+        ("requests", _call_requests),
+        ("ollama lib", _call_ollama_lib),
+    ]
+
+    print(f"Model: {MODEL_NAME}  |  Inputs: {n} ({source})  |  Max retries: {MAX_RETRIES}")
+    print(f"Backends: {', '.join(b[0] for b in backends)}")
+
+    all_results: dict[str, list[ExtractionResult]] = {}
+    for label, fn in backends:
+        print(f"  Running {label}...", flush=True)
+        results = _run_backend(test_inputs, fn, label)
+        all_results[label] = results
+
+    # --- Summary table ---
+    print(f"\n{'=' * 80}")
+    print("  SUMMARY")
+    print(f"{'=' * 80}")
+    print(f"  {'Backend':<16} {'Success':>8} {'Total (s)':>11} {'Avg (s)':>9} {'p50 (s)':>9} {'p90 (s)':>9} {'Failures':>9} {'Throughput':>11}")
+    print(f"  {'─'*16} {'─'*8} {'─'*11} {'─'*9} {'─'*9} {'─'*9} {'─'*9} {'─'*11}")
+    for label, _ in backends:
+        results = all_results[label]
+        s = sum(1 for r in results if r.success)
+        t = sum(r.elapsed for r in results)
+        f = n - s
+        avg = t / s if s else float("inf")
+        times = [r.elapsed for r in results if r.success]
+        p50 = _pct(times, 50) if times else 0
+        p90 = _pct(times, 90) if times else 0
+        throughput = s / t if t > 0 else 0
+        print(f"  {label:<16} {s:>8} {t:>11.2f} {avg:>9.3f} {p50:>9.3f} {p90:>9.3f} {f:>9} {throughput:>10.2f}/s")
+
+    total_ok = sum(sum(1 for r in results if r.success) for results in all_results.values())
+    print(f"\n  Total successful extractions: {total_ok}/{n * len(backends)}")
+
+    # --- Detailed stats per backend ---
+    for label, _ in backends:
+        print_detailed_stats(all_results[label], label)
+
+    # --- Cross-backend comparison tables (only for small counts) ---
+    if n <= 100:
+        print_title_year_comparison(all_results)
+        print_timing_comparison(all_results)
+
+    print_consistency_matrix(all_results)
+    print_error_summary(all_results)
+
+    if os.environ.get("SHOW_SAMPLES"):
+        show_samples(all_results, test_inputs)
 
 
 if __name__ == "__main__":
