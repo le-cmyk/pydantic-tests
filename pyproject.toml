@@ -1,11 +1,33 @@
 [project]
 name = "pydantic-tests"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "Benchmark urllib, requests, and ollama-library backends for structured LLM extraction with Pydantic v2 — featuring concurrency, retry logic, real-time progress, and color-coded cross-backend comparison."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "ollama>=0.6.2",
     "pydantic>=2.13.4",
     "requests>=2.34.2",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+ollama-extract = "ollama_extract.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ollama_extract"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
 ]

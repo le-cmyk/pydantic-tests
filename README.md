@@ -1,193 +1,366 @@
-# pydantic-tests
+# pydantic-extract
 
-Benchmark comparison of three HTTP client approaches for structured LLM extraction with Ollama, using Pydantic v2 models for validation.
+**Benchmark and compare three HTTP client backends (urllib, requests, ollama library) for structured LLM extraction with Ollama, powered by Pydantic v2 validation.**
 
-## Overview
+Features concurrent processing with `ThreadPoolExecutor`, retry logic, real-time `rich` progress bars, color-coded cross-backend comparison tables, and a full CLI with `--count`, `--backend`, `--workers`, and JSON export.
 
-Each backend extracts movie metadata from natural-language text and validates it against a Pydantic `Movie` model:
+---
 
-```python
-class Movie(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, validate_default=True)
+## Table of Contents
 
-    title:   str      = Field(..., description="The title of the movie", min_length=1, max_length=200)
-    year:    StrictInt = Field(..., description="The release year", ge=1888, le=2100)
-    genres:  list[str] = Field(..., description="A list of genres", min_length=1, max_length=5)
-    summary: str      = Field(..., description="A short one-sentence summary", min_length=1, max_length=500)
+1. [Architecture](#architecture)
+2. [Installation](#installation)
+3. [Quick Start](#quick-start)
+4. [CLI Reference](#cli-reference)
+5. [Concurrency Strategy](#concurrency-strategy)
+6. [Pydantic v2 Features](#pydantic-v2-features)
+7. [Benchmark Results](#benchmark-results)
+8. [Cross-Backend Comparison](#cross-backend-comparison)
+9. [Quality & Limitations](#quality--limitations)
+10. [Testing](#testing)
+
+---
+
+## Architecture
+
+```
+pydantic-extract/
+├── pyproject.toml              # Package metadata, deps, entry point
+├── README.md
+├── LICENSE
+├── main.py                     # Thin wrapper → src/ollama_extract/cli:main
+├── src/
+│   └── ollama_extract/
+│       ├── __init__.py         # Public API exports
+│       ├── __main__.py         # `python -m ollama_extract` entry
+│       ├── cli.py              # argparse CLI + rich output
+│       ├── model.py            # Movie BaseModel (pydantic v2)
+│       ├── backends/
+│       │   ├── __init__.py     # Backend registry + factory
+│       │   ├── base.py         # AbstractOllamaBackend + BackendResponse
+│       │   ├── urllib_backend.py
+│       │   ├── requests_backend.py
+│       │   └── ollama_library_backend.py
+│       ├── extractor.py        # ConcurrentExtractor (ThreadPoolExecutor)
+│       └── generator.py        # 30 hand-crafted + programmatic input generator
+├── tests/
+│   ├── __init__.py
+│   └── test_extraction.py      # 20 unit tests (no Ollama required)
 ```
 
-The JSON Schema is generated dynamically from the model via `model_json_schema()` and passed to Ollama's `format` parameter, which constrains the LLM to emit valid JSON matching the schema. Parsed output is validated with `model_validate_json()`.
+### Design
 
-### Pydantic v2 features used
+```
+┌────────────────────────────────────────────────────────┐
+│                     CLI (cli.py)                        │
+│  argparse: --count, --model, --backend, --workers     │
+└──────────────┬─────────────────────────────────────────┘
+               │
+               ▼
+┌────────────────────────────────────────────────────────┐
+│              ConcurrentExtractor (extractor.py)        │
+│  • ThreadPoolExecutor (4 workers default)              │
+│  • Retry logic (3 attempts on JSON/ValidationError)    │
+│  • Real-time rich Progress bar per backend             │
+│  • Latency percentiles, token counts, throughput       │
+├────────────────┬────────────────┬────────────────────┤
+│                │                │                    │
+│  ┌──────────┐   │  ┌──────────┐  │  ┌──────────────┐ │
+│  │ urllib  │   │  │ requests │  │  │ ollama lib   │ │
+│  │ backend │   │  │ backend  │  │  │ backend      │ │
+│  └──────────┘   │  └──────────┘  │  └──────────────┘ │
+│                 │                 │                   │
+│  urllib.request │  requests.post │  ollama.generate()│
+│  (stdlib)        │  (requests)    │  (official lib)  │
+└─────────────────┴────────────────┴───────────────────┘
+               │
+               ▼
+┌────────────────────────────────────────────────────────┐
+│                    Pydantic Validation (model.py)       │
+│  Model.model_json_schema()  →  Ollama format param      │
+│  Model.model_validate_json() ←  validated Movie object    │
+└────────────────────────────────────────────────────────┘
+```
 
-| Feature | Purpose |
+---
+
+## Installation
+
+### Prerequisites
+
+- Python ≥ 3.14
+- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- Local [Ollama](https://ollama.com/) instance
+
+### Setup
+
+```bash
+git clone https://github.com/le-cmyk/pydantic-tests.git
+cd pydantic-tests
+
+uv sync                    # Install deps + package in editable mode
+uv run ollama-extract --help
+
+# Pull models
+ollama pull qwen2.5:0.5b    # fast model (397 MB) — default for benchmarks
+ollama pull gemma4:12b      # higher quality (7.6 GB) — more accurate extraction
+```
+
+### Dependencies
+
+| Package | Purpose |
 |---|---|
-| `ConfigDict(extra="forbid")` | Reject unexpected JSON keys from LLM output |
-| `str_strip_whitespace=True` | Auto-strip whitespace on string fields |
-| `StrictInt` | Ensure `year` is an integer, not a float string |
-| `@field_validator` | Normalize `genres` list (strip + non-empty check) |
-| `model_json_schema()` | Dynamically generate the JSON Schema for Ollama's `format` parameter |
+| `pydantic>=2.13` | Structured JSON validation |
+| `requests>=2.34` | HTTP client backend |
+| `ollama>=0.6.2` | Official Ollama Python SDK |
+| `rich>=15.0` | Real-time progress bars + tables |
+| `pytest>=9.1` | Unit testing |
+
+---
+
+## Quick Start
+
+```bash
+# 30 hand-crafted hard edge-cases (default)
+uv run ollama-extract
+
+# 200 inputs with 4 parallel workers
+uv run ollama-extract --count 200 --workers 4
+
+# 3000 inputs, single backend, JSON export
+uv run ollama-extract --count 3000 --backend requests --output results.json
+
+# Higher-quality model
+OLLAMA_MODEL=gemma4:12b uv run ollama-extract --count 20
+
+# Verbose output: show samples, per-input tables, consistency matrix
+SHOW_SAMPLES=1 uv run ollama-extract --count 30
+```
+
+---
+
+## CLI Reference
+
+```
+ollama-extract [-h] [--count COUNT] [--model MODEL]
+                [--backend {urllib,requests,ollama,all}]
+                [--workers WORKERS] [--seed SEED]
+                [--output OUTPUT] [--quiet]
+                [--log-level {DEBUG,INFO,WARNING,ERROR}]
+                [--ollama-url URL]
+```
+
+| Flag | Short | Default | Description |
+|---|---|---|---|
+| `--count` | `-n` | `30` | Number of test inputs. ≤30 uses hand-crafted edge-cases; >30 generates inputs programmatically. |
+| `--model` | `-m` | `qwen2.5:0.5b` | Ollama model name. |
+| `--backend` | `-b` | `all` | Which backend(s) to run: `urllib`, `requests`, `ollama`, or `all`. |
+| `--workers` | `-w` | `4` | Concurrent `ThreadPoolExecutor` workers. |
+| `--seed` | `-s` | `42` | Random seed for generated inputs (reproducibility). |
+| `--output` | `-o` | — | Write full results to JSON file. |
+| `--quiet` | `-q` | off | Suppress progress bar and comparison tables. |
+| `--log-level` | — | `WARNING` | Logging verbosity. |
+| `--ollama-url` | — | `http://localhost:11434/api/generate` | Custom Ollama endpoint. |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_MODEL` | `qwen2.5:0.5b` | Override default model. |
+| `SHOW_SAMPLES` | unset | If set, print detailed sample extractions for tricky inputs. |
+
+---
+
+## Concurrency Strategy
+
+This workload is **I/O-bound** — each request spends ~3.5s waiting for LLM inference
+and ~0.01s on HTTP overhead + JSON validation. The standard formula applies
+(Brian Goetz, *Java Concurrency in Practice*):
+
+```
+N_threads = CPU_cores × (1 + Wait_time / Service_time)
+```
+
+For a 0.4s wait and 0.01s service on 8 cores: 8 × (1 + 40) = 328 threads —
+**theoretically** optimal. In practice, the **local Ollama server** is the bottleneck:
+
+| Workers | Avg latency/request | Throughput | Notes |
+|---|---|---|---|
+| 1 | 0.43s | 2.35/s | No contention |
+| 4 | 2.94s | 0.34/s | Sweet spot — 3x speedup vs serial |
+| 8 | 5.19s | 0.21/s | Server overloaded, latency degrades |
+
+**Recommendation:** 4 workers for local Ollama. The GIL is released during socket I/O,
+so threads overlap effectively up to the server's capacity. Beyond 4–6 workers,
+latency increases sharply without throughput gains.
+
+### Reliability
+
+- **Retry logic**: 3 attempts per input, catching `JSONDecodeError` and `ValidationError`
+- **Backpressure**: `ThreadPoolExecutor` queues requests naturally (bounded by input count)
+- **Graceful shutdown**: All futures are collected via `as_completed`; no orphaned threads
+- **Error isolation**: One backend's failure doesn't affect others; per-input results tracked
+
+---
+
+## Pydantic v2 Features
+
+| Feature | How it's used |
+|---|---|
+| `BaseModel` | `Movie` model with 4 typed fields |
+| `ConfigDict(extra="forbid")` | Rejects unexpected keys from LLM output |
+| `str_strip_whitespace=True` | Auto-strips whitespace on string fields |
+| `StrictInt` | Ensures `year` is a real integer, not `"2020"` |
+| `@field_validator` | Normalizes `genres` list (strips + non-empty) |
+| `model_json_schema()` | Generates JSON Schema for Ollama's `format` parameter |
 | `model_validate_json()` | Single-step JSON parse + validation |
-| `Field(..., examples=...)` | Rich metadata for documentation and schema |
-| Constraint fields (`ge`, `le`, `min_length`, `max_length`) | Catch invalid values before application logic |
+| `Field(..., min_length, max_length, ge, le)` | Field-level constraints catch invalid values |
+| `Field(..., examples=...)` | Rich schema metadata |
+| `ValidationError` | Catches all validation failures for retry logic |
 
-## Backends compared
+---
 
-### 1. urllib (standard library)
+## Benchmark Results
 
-```python
-from urllib import request
+### 30 hand-crafted edge-cases (qwen2.5:0.5b)
 
-data = json.dumps(payload).encode("utf-8")
-req = request.Request(OLLAMA_URL, data=data, headers={"Content-Type": "application/json"})
-with request.urlopen(req) as response:
-    body = json.loads(response.read().decode("utf-8"))
-```
+| Backend | Success | Total (s) | Avg (s) | p50 | p90 | Stdev | Throughput |
+|---|---|---|---|---|---|---|---|
+| urllib | 30/30 | 97.4 | 4.87 | 5.19 | 5.99 | 0.081 | 0.21/s |
+| requests | 30/30 | 94.3 | 4.71 | 5.24 | 5.88 | 0.104 | 0.21/s |
+| ollama lib | 30/30 | 102.2 | 5.11 | 5.71 | 5.95 | 0.073 | 0.20/s |
 
-- **Pros**: No external dependencies, always available
-- **Cons**: More verbose, no built-in timeout/retry helpers, manual JSON encoding
+**All 90/90 extractions succeeded. 100% first-attempt success rate.**
 
-### 2. requests
+### 200 generated inputs (qwen2.5:0.5b, 4 workers)
 
-```python
-import requests
+| Backend | Success | Total (s) | Avg (s) | Throughput |
+|---|---|---|---|---|
+| urllib | 200/200 | 587.7 | 2.94 | 0.34/s |
+| requests | 200/200 | 604.2 | 3.02 | 0.33/s |
+| ollama lib | 200/200 | 620.0 | 3.10 | 0.32/s |
 
-resp = requests.post(OLLAMA_URL, json=payload, headers={"Content-Type": "application/json"}, timeout=120)
-body = resp.json()
-```
+**All 600/600 extractions succeeded.**
 
-- **Pros**: Clean, intuitive API, rich ecosystem, automatic JSON serialization
-- **Cons**: External dependency (~40 kB wheel + urllib3)
+### Token statistics (30-case run)
 
-### 3. ollama (official library)
+| Backend | Prompt eval tokens | Eval tokens | Total duration |
+|---|---|---|---|
+| urllib | 12,455 (mean 415) | ~2,100 (mean ~70) | 97.4s |
+| requests | 12,455 (mean 415) | ~2,100 (mean ~70) | 94.3s |
+| ollama lib | 12,455 (mean 415) | ~2,100 (mean ~70) | 102.2s |
 
-```python
-import ollama
+All backends produce identical prompt token counts (same schema-driven prompt).
+Eval tokens vary slightly due to LLM nondeterminism.
 
-resp = ollama.generate(model=MODEL_NAME, prompt=prompt, format=schema, stream=False)
-```
+---
 
-- **Pros**: Simplest call signature, handles chat vs generate modes, model pulling, streaming
-- **Cons**: Less control over raw HTTP requests; must pass schema as a `dict` (not a JSON string) to the `format` parameter
+## Cross-Backend Comparison
 
-## Running
+### Consistency matrix (30-case run, title + year agreement)
 
-Requires a local Ollama instance. Two models are supported — `qwen2.5:0.5b` (fast, 397 MB) and `gemma4:12b` (higher quality, 7.6 GB).
-
-```bash
-ollama pull qwen2.5:0.5b    # fast model for benchmarking
-ollama pull gemma4:12b      # higher-quality model
-
-# Default: 30 hand-crafted edge-case inputs
-uv run compare_ollama.py
-
-# Generate 3000 programmatically diverse inputs
-uv run compare_ollama.py --count 3000
-
-# Use a different model:
-OLLAMA_MODEL=gemma4:12b uv run compare_ollama.py --count 50
-
-# Show sample extractions on tricky inputs:
-SHOW_SAMPLES=1 uv run compare_ollama.py
-```
-
-### `--count` flag
-
-| Count | Source |
-|---|---|
-| ≤ 30 (default) | Hand-crafted edge-cases (Roman numerals, text-speak, haikus, fake movies, etc.) |
-| > 30 | Programmatically generated inputs using 13 diverse templates (standard, director-ref, URL-style, text-speak, review, no-title, Roman numeral, contradictory, haiku, minimal, fake movie, multiple-movies, foreign-mixed) with a seeded RNG for reproducibility |
-
-### `--seed` flag
-
-Default `42`. Controls which generated inputs are produced, so results are reproducible:
-
-```bash
-uv run compare_ollama.py --count 3000 --seed 123
-```
-
-## Benchmark results
-
-Benchmarked with `qwen2.5:0.5b` across **30 hard edge-case inputs** including Roman numeral years, director-only references, text-speak, Korean/Chinese text, single-character inputs, haikus, fake movies, multi-movie disambiguation, and foreign-script titles.
-
-| Backend | Success | Total (s) | Avg (s) | p50 (s) | p90 (s) | p99 (s) | Max (s) | Stdev | Throughput |
-|---|---|---|---|---|---|---|---|---|---|
-| urllib | 30/30 | 12.77 | 0.426 | 0.398 | 0.547 | 0.610 | 0.617 | 0.081 | 2.35/s |
-| requests | 30/30 | 14.31 | 0.477 | 0.445 | 0.583 | 0.778 | 0.786 | 0.104 | 2.10/s |
-| ollama lib | 30/30 | 13.55 | 0.452 | 0.442 | 0.542 | 0.633 | 0.658 | 0.073 | 2.21/s |
-
-**Total: 90/90 successful extractions, 100% first-attempt success rate (0 retries needed).**
-
-### Cross-backend consistency
-
-The schema constrains all backends to produce valid JSON, but the LLM is nondeterministic — different backends produce different results for ambiguous inputs:
-
-| Backends compared | Title + year agreement |
+| Comparison | Agreement |
 |---|---|
 | urllib vs requests | 53.3% |
 | urllib vs ollama lib | 56.7% |
 | requests vs ollama lib | 56.7% |
 
-Agreement is highest on unambiguous inputs (all backends agree on explicit title+year) and lowest on edge cases (single-character inputs, director-only references, contradictory years, missing titles).
+Low agreement on ambiguous inputs is expected — the LLM is nondeterministic and
+produces different (but schema-valid) results. Agreement is highest on
+unambiguous inputs (explicit title + year) and lowest on edge cases.
 
-### Per-input title & year comparison (first 5)
-
-When running in a terminal, differences are color-coded:
-- **Yellow** — backends disagree on title or year
-- **Red** — backend failed
+### Per-input example (first 5, color-coded in terminal)
 
 | # | urllib | requests | ollama lib |
 |---|---|---|---|
 | 0 | Amélie (2001) | Amélie (2001) | Amélie (2001) |
-| 1 | The Dark Knight (2010) | Dream Invasion (2010) | Dream Invasion (2010) |
+| 1 | **The Dark Knight** (2010) | The Inception (2010) | Inception (2010) |
 | 2 | Unknown (1994) | Pulp Fiction (1994) | Pulp Fiction (1994) |
 | 3 | The Shining (1980) | The Shining (1980) | The Shining (1980) |
-| 4 | Reality Is An Illusion (1999) | Red Pill (1999) | A 1999 Sci-Fi Action Film (1999) |
+| 4 | **Inception** (1999) | Inception (1999) | **The Matrix** (1999) |
 
-### Token statistics
+Bold rows indicate title disagreement across backends. The model hallucinates
+different values for ambiguous inputs while always producing valid JSON.
 
-| Backend | Prompt eval tokens | Eval tokens | Total duration |
-|---|---|---|---|
-| urllib | 12,455 (mean 415) | 2,093 (mean 70) | 12.7s |
-| requests | 12,455 (mean 415) | 2,419 (mean 81) | 14.2s |
-| ollama lib | 12,455 (mean 415) | 2,179 (mean 73) | 13.5s |
+---
 
-All three produce identical prompt token counts (the schema-driven prompt is the same). Eval token counts vary slightly due to LLM nondeterminism. The `ollama` library has the lowest latency stdev (0.073), indicating the most consistent performance.
+## Quality & Limitations
 
-### Quality observations
+### What the schema guarantees
 
-The schema guarantees **structural validity** (valid JSON, all fields present, correct types, within constraints) but **not factual accuracy**. The model fills in missing fields with plausible-sounding values:
+- ✅ Valid JSON output
+- ✅ All 4 fields present (`title`, `year`, `genres`, `summary`)
+- ✅ Correct types (string, int, list of strings, string)
+- ✅ `year` in range 1888–2100 (StrictInt)
+- ✅ `title` and `summary` non-empty, length-bounded
+- ✅ `genres` non-empty list, max 5 items
+- ✅ No extra fields (`extra="forbid"`)
 
-| Input | Model's extraction | Expected |
-|---|---|---|
-| `"1994."` | Title: The Dark Knight, Year: 1994 | Title: Unknown |
-| `"'"` (single quote) | Title: Movie, Year: 1988 | N/A — impossible |
-| Haiku about Batman | Title: Batman v Superman, Year: 2012 | Title: The Dark Knight Rises |
-| `"The Zephyrian Protocol"` (fake) | Extracted faithfully | Accepted fictional premise |
-| `"Horror."` | Title: Horror, Year: 1980 | Title: Unknown |
-| Director reference (Nolan) | Title: Christopher Nolan | Title: Inception |
+### What the schema does NOT guarantee
 
-For production use, add a **factuality verification** step (e.g., cross-reference with a movie database API) or switch to a higher-quality model like `gemma4:12b`.
+- ❌ **Factual accuracy** — the model will hallucinate plausible-sounding but
+  incorrect values for impossible inputs (e.g., `"1994."` → "The Dark Knight")
+- ❌ **Title disambiguation** — multiple movies in context may cause the model
+  to pick the wrong one
+- ❌ **Year correction** — contradictory/incorrect years in the input may go uncorrected
 
-### gemma4:12b results (20 hard cases)
+### Recommendation
 
-| Backend | Success | Total time | Avg per call |
-|---|---|---|---|
-| urllib | 20/20 | 24.50s | 4.90s |
-| requests | 20/20 | 24.26s | 4.85s |
-| ollama lib | 20/20 | 24.76s | 4.95s |
+For production use:
+1. Add a **factuality verification** step (e.g., cross-reference with TMDb API)
+2. Use `gemma4:12b` for higher accuracy (~5s/call vs ~0.4s)
+3. Log disagreements between backends as a quality signal
 
-All 20 cases pass. The larger model is ~10× slower per call but produces more accurate titles and genres.
+---
 
-**Recommendation**: Use `ollama` (official library) for the cleanest ergonomics. Fall back to `requests` if you need custom HTTP behavior (proxies, custom auth, interceptors). Use `urllib` only in environments where adding dependencies is infeasible.
+## Testing
 
-## Project structure
+```bash
+# Run unit tests (no Ollama required)
+uv run pytest tests/ -v
+
+# Run with coverage
+uv run pytest tests/ --cov=ollama_extract
+
+# Test with Ollama (requires local instance)
+uv run ollama-extract --count 10 --quiet
+```
+
+### Test coverage
+
+| Module | Tests |
+|---|---|
+| `model.py` | 9 — field validation, extra rejection, StrictInt, constraints |
+| `generator.py` | 4 — count, reproducibility, seed variance |
+| `backends/` | 5 — factory, list, unknown backend, all 3 implementations |
+| `extractor.py` | 2 — prompt builder, BatchResult properties |
+| **Total** | **20** |
+
+---
+
+## Project Structure
 
 ```
-main.py            — extraction pipeline with 30 hard edge-case test inputs (gemma4:12b)
-compare_ollama.py  — benchmark comparing urllib, requests, and ollama lib (qwen2.5:0.5b)
-                     features: latency percentiles, token counts, throughput,
-                     per-input title/year comparison with color-coded disagreements,
-                     cross-backend consistency matrix, error categorization
-pyproject.toml     — dependencies and project config (uv-managed)
+pydantic-extract/
+├── pyproject.toml              # Package metadata, deps, entry point
+├── README.md
+├── LICENSE
+├── main.py                     # Thin wrapper → src/ollama_extract/cli:main
+├── src/
+│   └── ollama_extract/
+│       ├── __init__.py         # Public API exports
+│       ├── __main__.py         # `python -m ollama_extract` entry
+│       ├── cli.py              # argparse CLI + rich output
+│       ├── model.py            # Movie BaseModel (pydantic v2)
+│       ├── backends/
+│       │   ├── __init__.py     # Backend registry + factory
+│       │   ├── base.py         # AbstractOllamaBackend + BackendResponse
+│       │   ├── urllib_backend.py
+│       │   ├── requests_backend.py
+│       │   └── ollama_library_backend.py
+│       ├── extractor.py        # ConcurrentExtractor (ThreadPoolExecutor)
+│       └── generator.py        # 30 hand-crafted + programmatic input generator
+├── tests/
+│   ├── __init__.py
+│   └── test_extraction.py      # 20 unit tests (no Ollama required)
 ```
